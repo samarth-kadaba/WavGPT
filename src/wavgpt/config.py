@@ -6,9 +6,9 @@ import torch
 MODEL_NAME = "gpt2-large"  # or "gpt2-medium", "gpt2-large", etc.
 BLOCK_SIZE = 256  # sequence length (must be power of 2 for wavelets)
 BATCH_SIZE = 8
-KEEP_RATIO = 1 / 256  # keep ratio of wavelet coefficients
+KEEP_RATIO = 1 / BLOCK_SIZE  # keep ratio of wavelet coefficients
 LEARNING_RATE = 5e-4
-NUM_EPOCHS = 1
+NUM_EPOCHS = 3
 LOG_INTERVAL = 100  # log every N steps
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 WANDB_PROJECT = "invertible-gpt-refinement"
