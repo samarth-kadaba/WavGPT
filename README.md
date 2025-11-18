@@ -72,7 +72,7 @@ Edit `src/wavgpt/config.py` to modify training hyperparameters:
 - `KEEP_RATIO`: Fraction of wavelet coefficients to keep (default: 1/256)
 - `LEARNING_RATE`: Learning rate (default: 5e-4)
 - `NUM_EPOCHS`: Number of training epochs (default: 1)
-- `TEMPERATURE`: Temperature for knowledge distillation (default: 2.0)
+- `TEMPERATURE`: Temperature for knowledge distillation (default: 2.0) 
 
 ### Analysis
 
