@@ -3,18 +3,19 @@
 import torch
 
 # Model configuration
-MODEL_NAME = "gpt2-large"  # or "gpt2-medium", "gpt2-large", etc.
+MODEL_NAME = "bert-large-uncased"  # BERT for bidirectional embeddings (bert-base: 768, bert-large: 1024)
 BLOCK_SIZE = 256  # sequence length (must be power of 2 for wavelets)
 BATCH_SIZE = 8
 KEEP_RATIO = 1 / BLOCK_SIZE  # keep ratio of wavelet coefficients
 LEARNING_RATE = 5e-4
 NUM_EPOCHS = 3
 LOG_INTERVAL = 100  # log every N steps
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-WANDB_PROJECT = "invertible-gpt-refinement"
+# set DEVICE, cuda for GPU, mps for M1/M2 Macs, cpu for CPU
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+WANDB_PROJECT = "invertible-bert-refinement"
 TEMPERATURE = 2.0  # for knowledge distillation
 
-HIDDEN_SIZE = 1280  # Hidden dimension size
+HIDDEN_SIZE = 1024  # Hidden dimension size (bert-base: 768, bert-large: 1024)
 WAVELET_LEVELS = None  # Auto-compute from BLOCK_SIZE (or set to specific int)
 REFINE_N_LAYERS = 3  # Number of transformer layers in refinement
 REFINE_N_HEADS = 8  # Number of attention heads

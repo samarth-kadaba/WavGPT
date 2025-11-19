@@ -13,6 +13,9 @@ def compute_loss(h_orig, h_refined, h_approx, logits_orig, logits_refined,
                  input_ids, tokenizer, temperature=2.0):
     """
     Compute multi-component loss for training.
+    
+    Note: For BERT (bidirectional model), no label shifting is needed.
+    h[i] represents token[i], so logits[i] predicts token[i] directly.
     """
     # 1. Hidden state reconstruction loss (L2)
     loss_hidden_refined = F.mse_loss(h_refined, h_orig)
@@ -22,12 +25,10 @@ def compute_loss(h_orig, h_refined, h_approx, logits_orig, logits_refined,
     loss_logits = F.mse_loss(logits_refined, logits_orig)
 
     # 3. Cross-entropy loss on actual tokens
-    # Shift for causal LM
-    shift_logits = logits_refined[:, :-1, :].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
+    # NO SHIFTING for BERT - h[i] represents token[i]
     loss_ce = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
+        logits_refined.view(-1, logits_refined.size(-1)),
+        input_ids.view(-1),
         ignore_index=tokenizer.pad_token_id,
         reduction='mean'
     )
@@ -105,7 +106,7 @@ def train_model(model, lm_model, tokenizer, train_loader, optimizer, num_epochs,
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
 
-            # Get original hidden states and logits (frozen LM)
+            # Get original hidden states and logits (frozen BERT)
             with torch.no_grad():
                 outputs = lm_model(
                     input_ids=input_ids,
@@ -113,13 +114,14 @@ def train_model(model, lm_model, tokenizer, train_loader, optimizer, num_epochs,
                     output_hidden_states=True,
                 )
                 h_orig = outputs.hidden_states[-1]  # (B, T, d)
-                logits_orig = lm_model.lm_head(h_orig)  # (B, T, vocab)
+                # BERT uses cls.predictions for the MLM head
+                logits_orig = lm_model.cls.predictions(h_orig)  # (B, T, vocab)
 
             # Forward through our model
             h_refined, h_approx, coeffs_sparse, mask_kept, importance_map = model(h_orig, training=True)
 
-            # Get logits from refined hidden states
-            logits_refined = lm_model.lm_head(h_refined)
+            # Get logits from refined hidden states using BERT's MLM head
+            logits_refined = lm_model.cls.predictions(h_refined)
 
             # Compute losses
             losses = compute_loss(
@@ -147,21 +149,17 @@ def train_model(model, lm_model, tokenizer, train_loader, optimizer, num_epochs,
 
             # Detailed logging
             if global_step % log_interval == 0:
-                # Compute perplexity
+                # Compute perplexity (no shifting needed for BERT)
                 with torch.no_grad():
-                    shift_logits_orig = logits_orig[:, :-1, :].contiguous()
-                    shift_logits_refined = logits_refined[:, :-1, :].contiguous()
-                    shift_labels = input_ids[:, 1:].contiguous()
-
                     ce_orig = F.cross_entropy(
-                        shift_logits_orig.view(-1, shift_logits_orig.size(-1)),
-                        shift_labels.view(-1),
+                        logits_orig.view(-1, logits_orig.size(-1)),
+                        input_ids.view(-1),
                         ignore_index=tokenizer.pad_token_id,
                         reduction='mean'
                     )
                     ce_refined = F.cross_entropy(
-                        shift_logits_refined.view(-1, shift_logits_refined.size(-1)),
-                        shift_labels.view(-1),
+                        logits_refined.view(-1, logits_refined.size(-1)),
+                        input_ids.view(-1),
                         ignore_index=tokenizer.pad_token_id,
                         reduction='mean'
                     )

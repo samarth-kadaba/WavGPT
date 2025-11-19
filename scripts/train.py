@@ -3,7 +3,7 @@
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, BertForMaskedLM
 import wandb
 
 from wavgpt.models import HybridWaveletRefinementModel
@@ -55,23 +55,25 @@ def main():
         }
     )
 
-    # Load tokenizer and model
-    print("\nLoading model and tokenizer...")
+    # Load tokenizer and BERT model
+    print("\nLoading BERT model and tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    # BERT has native pad token support
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token = tokenizer.unk_token
 
-    lm_model = AutoModelForCausalLM.from_pretrained(
+    lm_model = BertForMaskedLM.from_pretrained(
         MODEL_NAME,
         output_hidden_states=True,
     ).to(DEVICE)
     lm_model.eval()
     for p in lm_model.parameters():
-        p.requires_grad = False  # Freeze the language model
+        p.requires_grad = False  # Freeze the BERT model
 
     hidden_size = lm_model.config.hidden_size
     print(f"Loaded model: {MODEL_NAME}")
     print(f"Hidden size: {hidden_size}")
+    print(f"Note: Using BERT (bidirectional) for natural h[i]→token[i] alignment")
 
     # Prepare dataset
     print("\nPreparing dataset...")

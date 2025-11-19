@@ -2,7 +2,7 @@
 """Analysis script for WavGPT."""
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, BertForMaskedLM
 
 from wavgpt.models import HybridWaveletRefinementModel
 from wavgpt.analysis import full_filter_analysis
@@ -18,13 +18,13 @@ def main():
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
     config = checkpoint['config']
     
-    # Load tokenizer and base model
-    print("\nLoading base model and tokenizer...")
+    # Load tokenizer and BERT model
+    print("\nLoading BERT model and tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token = tokenizer.unk_token
     
-    lm_model = AutoModelForCausalLM.from_pretrained(
+    lm_model = BertForMaskedLM.from_pretrained(
         MODEL_NAME,
         output_hidden_states=True,
     ).to(DEVICE)

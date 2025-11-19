@@ -66,13 +66,15 @@ wavgpt-train
 
 Edit `src/wavgpt/config.py` to modify training hyperparameters:
 
-- `MODEL_NAME`: Base language model (default: "gpt2-large")
+- `MODEL_NAME`: Base language model (default: "bert-large-uncased")
 - `BLOCK_SIZE`: Sequence length (must be power of 2, default: 256)
 - `BATCH_SIZE`: Training batch size (default: 8)
 - `KEEP_RATIO`: Fraction of wavelet coefficients to keep (default: 1/256)
 - `LEARNING_RATE`: Learning rate (default: 5e-4)
-- `NUM_EPOCHS`: Number of training epochs (default: 1)
-- `TEMPERATURE`: Temperature for knowledge distillation (default: 2.0) 
+- `NUM_EPOCHS`: Number of training epochs (default: 3)
+- `TEMPERATURE`: Temperature for knowledge distillation (default: 2.0)
+
+**Note**: WavGPT uses BERT (bidirectional model) instead of GPT-2 (causal model) to enable true decodable embeddings. With BERT, hidden state `h[i]` represents token `[i]` directly, allowing perfect reconstruction without needing to store the first token separately. 
 
 ### Analysis
 
@@ -114,6 +116,15 @@ The model consists of three main components:
 1. **CompressedWaveletEmbedding**: Performs learnable wavelet transform on hidden states
 2. **LearnedFrequencyFilterBank**: Learns which frequency components to keep
 3. **HiddenStateRefinementNetwork**: Refines compressed hidden states using transformer layers
+
+### Why BERT Instead of GPT-2?
+
+WavGPT uses BERT (bidirectional) rather than GPT-2 (causal) for a fundamental architectural reason:
+
+- **GPT-2 (Causal)**: Hidden state `h[i]` predicts token `[i+1]` (next token). Cannot reconstruct the current sequence without storing the first token separately.
+- **BERT (Bidirectional)**: Hidden state `h[i]` represents token `[i]` directly. Allows perfect reconstruction from compressed hidden states alone.
+
+This makes BERT the natural choice for decodable embeddings where you want to compress text → hidden states → wavelet coefficients and then decompress back to the original text.
 
 ## Citation
 
