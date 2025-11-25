@@ -71,4 +71,6 @@ frequency_importance.png
 # UV
 .uv/
 
+# Analysis outputs
+analysis_outputs/
 

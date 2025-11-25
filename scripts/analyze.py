@@ -1,45 +1,71 @@
-#!/usr/bin/env python3
-"""Analysis script for WavGPT."""
+"""Example script to run WavGPT model analysis."""
 
-from transformers import AutoTokenizer, BertForMaskedLM
+import sys
+import torch
+from transformers import BertForMaskedLM, AutoTokenizer
 
 from wavgpt.utils.save_checkpoint import load_checkpoint_for_inference
+from wavgpt.config import DEVICE, MODEL_NAME, BLOCK_SIZE
+from wavgpt.data import prepare_dataset, IterableDatasetWrapper, create_collate_fn
 from wavgpt.analysis import full_filter_analysis
-from wavgpt.config import MODEL_NAME, DEVICE
 
 
-def main():
-    """Main analysis function."""
-    import os
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    project_root = os.path.dirname(script_dir)
-    checkpoint_path = os.path.join(project_root, "checkpoints", "hybrid_wavelet_model_ratio0.00390625.pt")
+def main(checkpoint_path: str, output_dir: str = None, n_batches: int = 10):
+    """
+    Run comprehensive analysis on a trained WavGPT model.
     
-    # Load model and checkpoint info
+    Args:
+        checkpoint_path: Path to model checkpoint
+        output_dir: Directory for outputs (default: analysis_outputs/)
+        n_batches: Number of batches to analyze
+    """
+    print("\n" + "="*80)
+    print("🔬 WavGPT Model Analysis")
+    print("="*80)
+    
+    # Load model
+    print(f"\nLoading checkpoint: {checkpoint_path}")
     model, info = load_checkpoint_for_inference(checkpoint_path, device=DEVICE)
+    print(f"✓ Model loaded from step {info.get('global_step', 'unknown')}")
     
-    # Load BERT model
-    print("\nLoading BERT model and tokenizer...")
+    # Load BERT
+    print(f"\nLoading BERT ({MODEL_NAME})...")
+    lm_model = BertForMaskedLM.from_pretrained(MODEL_NAME).to(DEVICE)
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.unk_token
-    
-    lm_model = BertForMaskedLM.from_pretrained(
-        MODEL_NAME,
-        output_hidden_states=True,
-    ).to(DEVICE)
     lm_model.eval()
+    print("✓ BERT loaded")
     
-    print("Model loaded successfully!")
-    print(f"Checkpoint metrics: {info['metrics']}")
+    # Prepare data
+    print(f"\nPreparing data...")
+    tokenized_dataset, length = prepare_dataset(tokenizer, BLOCK_SIZE)
+    dataset = IterableDatasetWrapper(tokenized_dataset, length)
+    collate_fn = create_collate_fn(tokenizer, BLOCK_SIZE)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=8,
+        collate_fn=collate_fn,
+    )
     
-    # TODO: Load your dataloader here
-    # dataloader = ...
-    # full_filter_analysis(model, lm_model, dataloader, n_batches=10, device=DEVICE)
+    # Run analysis
+    freq_stats, selection_stats = full_filter_analysis(
+        model=model,
+        lm_model=lm_model,
+        dataloader=dataloader,
+        n_batches=n_batches,
+        device=DEVICE,
+        output_dir=output_dir
+    )
     
-    print("\nNote: To run full analysis, provide a dataloader to the full_filter_analysis function.")
+    return freq_stats, selection_stats
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1:
+        checkpoint = sys.argv[1]
+    else:
+        checkpoint = '/home/ubuntu/WavGPT/checkpoints/hybrid_wavelet_model_ratio0.01_step36500.pt'
+    
+    output = sys.argv[2] if len(sys.argv) > 2 else None
+    
+    main(checkpoint, output)
 
