@@ -7,8 +7,9 @@ from transformers import AutoTokenizer, BertForMaskedLM
 import wandb
 
 from wavgpt.models import HybridWaveletRefinementModel
-from wavgpt.data import prepare_dataset, IterableDatasetWrapper
+from wavgpt.data import prepare_dataset, IterableDatasetWrapper, create_collate_fn
 from wavgpt.training import train_model, create_scheduler
+from wavgpt.utils.load_checkpoint import load_checkpoint_for_training
 from wavgpt.config import (
     MODEL_NAME,
     BLOCK_SIZE,
@@ -27,6 +28,7 @@ from wavgpt.config import (
     REFINE_DIM_FEEDFORWARD,
     USE_TEMPORAL_ATTENTION,
     WARMUP_RATIO,
+    CHECKPOINT_PATH,
 )
 
 
@@ -79,7 +81,10 @@ def main():
     print("\nPreparing dataset...")
     train_dataset, num_rows = prepare_dataset(tokenizer, BLOCK_SIZE)
     train_dataset_wrapped = IterableDatasetWrapper(train_dataset, num_rows)
-    train_loader = DataLoader(train_dataset_wrapped, batch_size=BATCH_SIZE)
+    
+    # Create collate function for dynamic padding
+    collate_fn = create_collate_fn(tokenizer, BLOCK_SIZE)
+    train_loader = DataLoader(train_dataset_wrapped, batch_size=BATCH_SIZE, collate_fn=collate_fn)
 
     # Create our hybrid model
     print("\nInitializing hybrid wavelet refinement model...")
@@ -105,6 +110,20 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
     scheduler = create_scheduler(optimizer, NUM_EPOCHS, train_loader, warmup_ratio=WARMUP_RATIO)
 
+    # Load checkpoint if specified
+    start_epoch = 0
+    start_global_step = 0
+    if CHECKPOINT_PATH:
+        checkpoint_info = load_checkpoint_for_training(
+            checkpoint_path=CHECKPOINT_PATH,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=DEVICE
+        )
+        start_epoch = checkpoint_info['epoch']
+        start_global_step = checkpoint_info['global_step']
+
     # Train
     print("\nStarting training...")
     train_model(
@@ -118,23 +137,13 @@ def main():
         scheduler=scheduler,
         log_interval=LOG_INTERVAL,
         temperature=TEMPERATURE,
+        start_epoch=start_epoch,
+        start_global_step=start_global_step,
     )
 
     print("\n" + "="*60)
     print("Training complete!")
     print("="*60)
-
-    # Save model
-    save_path = f"hybrid_wavelet_model_ratio{KEEP_RATIO}.pt"
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': {
-            'seq_len': BLOCK_SIZE,
-            'hidden_size': hidden_size,
-            'keep_ratio': KEEP_RATIO,
-        }
-    }, save_path)
-    print(f"Model saved to {save_path}")
 
     wandb.finish()
 

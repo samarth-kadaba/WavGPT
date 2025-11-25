@@ -60,6 +60,8 @@ logs/
 Thumbs.db
 
 # Project specific
+checkpoints/
+models/
 hybrid_wavelet_model_*.pt
 frequency_importance.png
 *.png
@@ -68,4 +70,5 @@ frequency_importance.png
 
 # UV
 .uv/
+
 

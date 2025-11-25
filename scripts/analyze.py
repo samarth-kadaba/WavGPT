@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 """Analysis script for WavGPT."""
 
-import torch
 from transformers import AutoTokenizer, BertForMaskedLM
 
-from wavgpt.models import HybridWaveletRefinementModel
+from wavgpt.utils.save_checkpoint import load_checkpoint_for_inference
 from wavgpt.analysis import full_filter_analysis
 from wavgpt.config import MODEL_NAME, DEVICE
 
 
 def main():
     """Main analysis function."""
-    # Load model checkpoint
-    checkpoint_path = "hybrid_wavelet_model_ratio0.00390625.pt"  # Update with your checkpoint path
+    import os
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(script_dir)
+    checkpoint_path = os.path.join(project_root, "checkpoints", "hybrid_wavelet_model_ratio0.00390625.pt")
     
-    print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
-    config = checkpoint['config']
+    # Load model and checkpoint info
+    model, info = load_checkpoint_for_inference(checkpoint_path, device=DEVICE)
     
-    # Load tokenizer and BERT model
+    # Load BERT model
     print("\nLoading BERT model and tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     if tokenizer.pad_token_id is None:
@@ -30,22 +30,10 @@ def main():
     ).to(DEVICE)
     lm_model.eval()
     
-    # Initialize WavGPT model
-    print("\nInitializing WavGPT model...")
-    model = HybridWaveletRefinementModel(
-        seq_len=config['seq_len'],
-        hidden_size=config['hidden_size'],
-        keep_ratio=config['keep_ratio'],
-    ).to(DEVICE)
-    
-    # Load weights
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
     print("Model loaded successfully!")
+    print(f"Checkpoint metrics: {info['metrics']}")
     
     # TODO: Load your dataloader here
-    # For now, this is a placeholder - you'll need to provide a dataloader
     # dataloader = ...
     # full_filter_analysis(model, lm_model, dataloader, n_batches=10, device=DEVICE)
     

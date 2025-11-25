@@ -22,11 +22,13 @@ def prepare_dataset(tokenizer, block_size):
         if not texts:
             return {"input_ids": [], "attention_mask": []}
 
+        # Don't pad to max_length - let texts be their natural length
+        # This creates variable-length sequences (most will be close to block_size)
         tokenized = tokenizer(
             texts,
             truncation=True,
             max_length=block_size,
-            padding="max_length",
+            padding=False,  # Don't pad yet - we'll pad in collate_fn
             return_attention_mask=True,
         )
         return tokenized
@@ -70,4 +72,21 @@ def decode_trimmed(tokenizer, ids_tensor):
         first_pad = ids_list.index(tokenizer.pad_token_id)
         ids_list = ids_list[:first_pad]
     return tokenizer.decode(ids_list, skip_special_tokens=True)
+
+
+def create_collate_fn(tokenizer, block_size):
+    """
+    Create a collate function that pads sequences to block_size.
+    Uses tokenizer's built-in padding for simplicity.
+    """
+    def collate_fn(batch):
+        # Batch is list of dicts with 'input_ids' and 'attention_mask'
+        # Pad all sequences to block_size using tokenizer
+        return tokenizer.pad(
+            batch,
+            padding='max_length',
+            max_length=block_size,
+            return_tensors='pt'
+        )
+    return collate_fn
 

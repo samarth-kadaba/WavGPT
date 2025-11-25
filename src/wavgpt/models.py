@@ -173,21 +173,32 @@ class LearnedFrequencyFilterBank(nn.Module):
             mask = soft_mask
 
         else:
-            # Hard thresholding (inference or explicit request)
+            # Hard thresholding with Straight-Through Estimator (STE)
+            # Forward: hard binary mask
+            # Backward: gradient flows through soft mask
             k = int(T * d * self.target_sparsity)
 
-            masks = []
-            for b in range(B):
-                flat_imp = coeff_importance[b].view(-1)
-                threshold = torch.kthvalue(
-                    flat_imp,
-                    flat_imp.numel() - k + 1
-                )[0]
+            # Compute soft masks for backward pass
+            flat_importance = coeff_importance.view(B, -1)
+            threshold_vals = torch.kthvalue(
+                flat_importance,
+                flat_importance.shape[1] - k + 1,
+                dim=1,
+                keepdim=True
+            )[0]  # (B, 1)
+            threshold_vals = threshold_vals.view(B, 1, 1)
 
-                hard_mask = (coeff_importance[b] >= threshold).float()
-                masks.append(hard_mask)
+            # Soft mask for gradients (differentiable)
+            soft_mask = torch.sigmoid(
+                (coeff_importance - threshold_vals) / self.temperature.abs()
+            )
 
-            mask = torch.stack(masks, dim=0)
+            # Hard mask for forward pass (true sparsity)
+            hard_mask = (coeff_importance >= threshold_vals).float()
+
+            # Straight-Through Estimator: hard forward, soft backward
+            mask = hard_mask.detach() - soft_mask.detach() + soft_mask
+            
             coeffs_filtered = coeffs * mask
 
         return coeffs_filtered, mask, importance_map
@@ -493,7 +504,7 @@ class HybridWaveletRefinementModel(nn.Module):
 
         Args:
             h_orig: (B, T, d) - original hidden states from LM
-            training: whether in training mode
+            training: whether in training mode (NOTE: we use hard masks regardless!)
 
         Returns:
             h_refined: (B, T, d) - refined hidden states
@@ -505,17 +516,19 @@ class HybridWaveletRefinementModel(nn.Module):
         # Forward learnable lifting wavelet transform
         coeffs = self.wavelet_module._dwt_lifting_1d(h_orig)
 
-        # Apply learned frequency filter (REPLACES zerotree_sparsify)
+        # Apply learned frequency filter with HARD thresholding
+        # CRITICAL: Always use hard masks for true sparsity (compatible with OMP)
+        # Soft masks create ~115k partially-nonzero coeffs which defeats compression!
         coeffs_sparse, mask_kept, importance_map = self.frequency_filter(
             coeffs,
             training=training,
-            hard_threshold=not training
+            hard_threshold=True  # ALWAYS hard threshold for true sparsity!
         )
 
-        # Inverse wavelet transform (lossy reconstruction)
+        # Inverse wavelet transform (lossy reconstruction from HARD sparse coeffs)
         h_approx = self.wavelet_module._idwt_lifting_1d(coeffs_sparse)
 
-        # Refine in hidden space
+        # Refine in hidden space (critical for fixing hard-mask artifacts!)
         h_refined = self.refinement_network(h_approx, mask_kept)
 
         return h_refined, h_approx, coeffs_sparse, mask_kept, importance_map
