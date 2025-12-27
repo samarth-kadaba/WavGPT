@@ -1,30 +1,87 @@
-"""Configuration constants for WavGPT training and inference."""
+"""Configuration for Infinite Context Transformer."""
 
 import torch
 
-# Model configuration
-MODEL_NAME = "bert-base-uncased"  # BERT for bidirectional embeddings (bert-base: 768, bert-large: 1024)
-BLOCK_SIZE = 256  # sequence length (must be power of 2 for wavelets)
-BATCH_SIZE = 8
-KEEP_RATIO = 0.01  # keep ratio of wavelet coefficients
-LEARNING_RATE = 5e-4
-NUM_EPOCHS = 3
-LOG_INTERVAL = 100  # log every N steps
-# set DEVICE, cuda for GPU, mps for M1/M2 Macs, cpu for CPU
-DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-WANDB_PROJECT = "invertible-bert-refinement"
-TEMPERATURE = 2.0  # for knowledge distillation
+# =============================================================================
+# Device Configuration
+# =============================================================================
 
-HIDDEN_SIZE = 768  # Hidden dimension size (bert-base: 768, bert-large: 1024)
-WAVELET_LEVELS = None  # Auto-compute from BLOCK_SIZE (or set to specific int)
-REFINE_N_LAYERS = 3  # Number of transformer layers in refinement
-REFINE_N_HEADS = 8  # Number of attention heads
-REFINE_DIM_FEEDFORWARD = None  # Feedforward dimension (None = 4 * HIDDEN_SIZE)
-USE_TEMPORAL_ATTENTION = True  # Whether to use temporal attention
+DEVICE = (
+    "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+)
 
-WARMUP_RATIO = 0.05
+# =============================================================================
+# Model Configuration
+# =============================================================================
 
-# Checkpoint resumption
-CHECKPOINT_PATH = None # Set to checkpoint path to resume training
-# NOTE: /home/ubuntu/WavGPT/checkpoints/hybrid_wavelet_model_ratio0.00390625_step9000.pt is CORRUPTED
+# Model dimensions (GPT-2 Small equivalent ~120M params)
+VOCAB_SIZE = 50257  # GPT-2 tokenizer vocab size
+HIDDEN_SIZE = 768  # Model hidden dimension (GPT-2: 768)
+N_HEADS = 12  # Number of attention heads (GPT-2: 12, head_dim=64)
 
+# Layer counts (new architecture)
+N_BOUNDARY_LAYERS = 2  # Boundary detection SSM layers
+N_CHUNK_SSM_LAYERS = 2  # Per-chunk compression SSM layers
+N_CHUNK_TRANSFORMER_LAYERS = 8  # Chunk transformer layers (main compute)
+
+# =============================================================================
+# SSM Configuration
+# =============================================================================
+
+SSM_D_STATE = 16  # State dimension
+SSM_D_CONV = 4  # Convolution kernel size
+SSM_EXPAND = 2  # Expansion factor
+
+# =============================================================================
+# Chunking Configuration
+# =============================================================================
+
+MIN_CHUNK_SIZE = 32  # Larger chunks = fewer chunks = MUCH faster training
+MAX_CHUNKS = 256  # 8192/32 = 256 max chunks (was 1024, overkill)
+
+# Gumbel-Softmax temperature for boundary classifier
+GUMBEL_TEMPERATURE_INIT = 1.0
+
+# =============================================================================
+# Dataset Configuration
+# =============================================================================
+
+# Available: "c4", "wikitext", "wikipedia", "gutenberg", "code", "arxiv"
+DATASET_NAME = "c4"  # C4 - diverse web text (750GB, streaming)
+CONCAT_DOCUMENTS = True  # Concatenate docs to fill context
+MIN_SEQ_LENGTH = 64  # Minimum sequence length
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+
+BATCH_SIZE = 2  # Larger batch = better GPU utilization
+MAX_LENGTH = 8192  # Maximum sequence length - can go higher!
+LEARNING_RATE = 1e-4  # Lower LR = more stable training
+NUM_EPOCHS = 3  # Training epochs
+WARMUP_RATIO = 0.1  # Longer warmup = more stable early training
+MAX_GRAD_NORM = 1.0  # Gradient clipping
+GRADIENT_ACCUMULATION_STEPS = 4  # Effective batch = 4 * 4 = 16 (same)
+DROPOUT = 0.1  # Dropout rate
+
+# =============================================================================
+# Data Split Configuration
+# =============================================================================
+
+VAL_RATIO = 0.05  # 5% of data for validation
+TEST_RATIO = 0.05  # 5% of data for testing
+
+# =============================================================================
+# Logging Configuration
+# =============================================================================
+
+LOG_INTERVAL = 50  # More frequent logging for faster feedback
+SAVE_INTERVAL = 500  # Save more often to avoid losing progress
+VAL_INTERVAL = 200  # Validate every N steps
+WANDB_PROJECT = "infinite-context-transformer"
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+CHECKPOINT_DIR = "checkpoints"

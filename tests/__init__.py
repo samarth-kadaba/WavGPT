@@ -1,2 +1,1 @@
-"""Tests for WavGPT."""
-
+"""Tests for SSM-Guided Hierarchical Attention."""

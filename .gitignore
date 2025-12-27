@@ -46,7 +46,6 @@ ENV/
 wandb/
 
 # Data
-data/
 *.csv
 *.json
 *.parquet
@@ -61,16 +60,9 @@ Thumbs.db
 
 # Project specific
 checkpoints/
-models/
-hybrid_wavelet_model_*.pt
-frequency_importance.png
 *.png
 *.jpg
 *.pdf
 
 # UV
 .uv/
-
-# Analysis outputs
-analysis_outputs/
-
