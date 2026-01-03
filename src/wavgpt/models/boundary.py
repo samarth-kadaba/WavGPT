@@ -1,173 +1,329 @@
+"""Learnable chunk boundary detection with O(T) learned value function."""
+
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from wavgpt.models.config import InfiniteContextConfig
 from wavgpt.models.s4 import SSMLayer
 
 
+class BoundaryScorer(nn.Module):
+    """Scores potential boundary positions based on SSM state transitions."""
+
+    def __init__(self, config: InfiniteContextConfig):
+        super().__init__()
+        self.scorer = nn.Sequential(
+            nn.Linear(config.hidden_size * 2, config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_size, 1),
+        )
+        self.log_temperature = nn.Parameter(
+            torch.tensor(config.boundary_temperature_init).log()
+        )
+
+    def forward(self, ssm_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute boundary scores from SSM state transitions.
+        
+        Args:
+            ssm_outputs: (B, T, D) SSM hidden states
+            
+        Returns:
+            raw_probs: (B, T) raw boundary probabilities (before budget constraint)
+            temperature: Current temperature value
+        """
+        B, T, D = ssm_outputs.shape
+        device = ssm_outputs.device
+
+        # Concatenate current and previous state to detect transitions
+        prev_states = torch.cat([
+            torch.zeros(B, 1, D, device=device, dtype=ssm_outputs.dtype),
+            ssm_outputs[:, :-1, :]
+        ], dim=1)
+
+        state_pairs = torch.cat([ssm_outputs, prev_states], dim=-1)  # (B, T, 2D)
+        raw_scores = self.scorer(state_pairs).squeeze(-1)  # (B, T)
+
+        raw_scores = raw_scores.clone()
+        raw_scores[:, 0] = -1e4
+
+        temperature = self.log_temperature.exp().clamp(min=0.1, max=10.0)
+        raw_probs = torch.sigmoid(raw_scores / temperature)
+
+        return raw_probs, temperature
+
+
+class LearnedValueBackward(nn.Module):
+    """O(T) boundary detection using learned value function."""
+
+    def __init__(self, config: InfiniteContextConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        
+        self.value_net = nn.Sequential(
+            nn.Linear(config.hidden_size + 2, config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size // 2, 1),
+        )
+        
+        self.log_alpha = nn.Parameter(torch.tensor(0.0))
+
+    def forward(
+        self,
+        raw_probs: torch.Tensor,
+        ssm_states: torch.Tensor,
+        max_chunks: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute budget-constrained boundary posteriors via learned value function.
+        
+        Args:
+            raw_probs: (B, T) raw boundary probabilities from scorer
+            ssm_states: (B, T, D) SSM hidden states
+            max_chunks: K, maximum number of chunks
+            
+        Returns:
+            boundary_probs: (B, T) budget-aware boundary probabilities
+            expected_chunks: (B,) expected number of chunks per sequence
+        """
+        B, T, D = ssm_states.shape
+        device = ssm_states.device
+        dtype = ssm_states.dtype
+        max_boundaries = max(max_chunks - 1, 1)
+        
+        p = raw_probs.float().clamp(min=1e-6, max=1 - 1e-6)
+        
+        # Forward pass: track expected boundaries
+        cumsum_p = torch.cumsum(p, dim=-1)
+        expected_k = cumsum_p.clamp(max=max_boundaries)
+        
+        # Backward pass: learned value function
+        budget_frac = 1.0 - (expected_k / max_boundaries).clamp(0, 1)
+        position_frac = torch.arange(T, device=device, dtype=torch.float32) / max(T - 1, 1)
+        position_frac = position_frac.unsqueeze(0).expand(B, -1)
+        
+        features = torch.cat([
+            ssm_states.float(),
+            budget_frac.unsqueeze(-1),
+            position_frac.unsqueeze(-1),
+        ], dim=-1)
+        
+        value_logits = self.value_net(features).squeeze(-1)
+        
+        # Combine raw probs with learned value
+        alpha = self.log_alpha.exp().clamp(min=0.1, max=10.0)
+        raw_logits = (p / (1 - p + 1e-8)).log().clamp(min=-20, max=20)
+        combined_logits = raw_logits + alpha * value_logits
+        
+        # Budget-aware masking
+        budget_headroom = (max_boundaries - expected_k).clamp(min=0)
+        budget_gate = torch.sigmoid(budget_headroom * 5.0 - 1.0)
+        
+        boundary_probs = torch.sigmoid(combined_logits) * budget_gate
+        
+        # First position is never a boundary
+        boundary_probs = torch.cat([
+            torch.zeros(B, 1, device=device, dtype=torch.float32),
+            boundary_probs[:, 1:]
+        ], dim=1)
+        
+        boundary_probs = torch.where(
+            torch.isnan(boundary_probs) | torch.isinf(boundary_probs),
+            torch.zeros_like(boundary_probs),
+            boundary_probs
+        )
+        
+        boundary_probs = boundary_probs.clamp(min=0, max=1)
+        expected_chunks = 1 + boundary_probs.sum(dim=-1)
+        
+        return boundary_probs.to(dtype), expected_chunks
+
+
+class AmortizedBoundaryPredictor(nn.Module):
+    """Predicts boundaries using forward-only information for generation."""
+
+    def __init__(self, config: InfiniteContextConfig):
+        super().__init__()
+        self.predictor = nn.Sequential(
+            nn.Linear(config.hidden_size + 2, config.hidden_size),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_size, config.hidden_size // 2),
+            nn.GELU(),
+            nn.Linear(config.hidden_size // 2, 1),
+        )
+
+    def forward(
+        self,
+        ssm_states: torch.Tensor,
+        budget_frac: torch.Tensor,
+        position_frac: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Predict boundary probabilities from forward-only information.
+        
+        Args:
+            ssm_states: (B, T, D) or (B, D) SSM hidden states
+            budget_frac: (B, T) or (B,) remaining budget fraction
+            position_frac: (B, T) or (B,) position fraction in sequence
+            
+        Returns:
+            boundary_probs: (B, T) or (B,) predicted boundary probabilities
+        """
+        # Handle both batched sequence and single-step cases
+        if ssm_states.dim() == 2:
+            ssm_states = ssm_states.unsqueeze(1)
+            budget_frac = budget_frac.unsqueeze(1)
+            position_frac = position_frac.unsqueeze(1)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+
+        B, T, D = ssm_states.shape
+
+        features = torch.cat([
+            ssm_states,
+            budget_frac.unsqueeze(-1),
+            position_frac.unsqueeze(-1),
+        ], dim=-1)  # (B, T, D+2)
+
+        logits = self.predictor(features).squeeze(-1)
+        probs = torch.sigmoid(logits)
+
+        if T > 1:
+            mask = torch.ones_like(probs)
+            mask[:, 0] = 0.0
+            probs = probs * mask
+
+        if squeeze_output:
+            probs = probs.squeeze(1)
+
+        return probs
+
+    def distillation_loss(
+        self, predicted: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """Binary cross-entropy loss for distillation."""
+        pred = predicted.clamp(min=1e-7, max=1 - 1e-7)
+        tgt = target.detach().clamp(min=1e-7, max=1 - 1e-7)
+        bce = -(tgt * pred.log() + (1 - tgt) * (1 - pred).log())
+        return bce.mean()
+
+
 class BoundaryDetector(nn.Module):
-    """
-    Detects chunk boundaries using surprisal-based decisions from SSM outputs.
-
-    The SSM processes all tokens to understand global context, then we compute
-    surprisal (negative log likelihood) for each token. Boundaries are detected
-    when the average per-token likelihood decreases (surprisal increases) with
-    the addition of a token.
-
-    Fully vectorized implementation - no iteration loops!
-    """
+    """Learnable boundary detection with O(T) learned value function."""
 
     def __init__(self, config: InfiniteContextConfig):
         super().__init__()
         self.config = config
 
-        # Global SSM for boundary detection
-        self.ssm_layers = nn.ModuleList([SSMLayer(config) for _ in range(config.n_boundary_layers)])
+        self.ssm_layers = nn.ModuleList([
+            SSMLayer(config) for _ in range(config.n_boundary_layers)
+        ])
         self.norm = nn.LayerNorm(config.hidden_size)
+        self.scorer = BoundaryScorer(config)
+        self.learned_backward = LearnedValueBackward(config)
+        self.amortized = AmortizedBoundaryPredictor(config)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        input_ids: torch.Tensor,
-        lm_head: nn.Linear,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Detect boundaries from input embeddings using surprisal-based detection.
-
+        Detect boundaries with budget-constrained chunking.
+        
         Args:
             x: Token embeddings (B, T, D)
-            input_ids: Token IDs (B, T)
-            lm_head: Language model head to compute logits from SSM outputs
-
+            
         Returns:
-            boundary_logits: Surprisal change signals (B, T) - positive = boundary
-            boundary_decisions: Hard boundary decisions (B, T) - differentiable via STE!
-            ssm_output: SSM hidden states (B, T, D)
+            boundary_probs: (B, T) boundary probabilities
+            boundary_decisions: (B, T) hard decisions
+            ssm_output: (B, T, D) SSM hidden states
+            expected_chunks: (B,) expected number of chunks
+            distillation_loss: Scalar distillation loss
+            entropy_loss: Scalar entropy loss
+            sparsity_loss: Scalar sparsity loss
         """
-        # Run global SSM
+        B, T, D = x.shape
+        device = x.device
+
+        # Run SSM layers
         h = x
         for layer in self.ssm_layers:
             h, _ = layer(h, return_all_states=False)
-        h = self.norm(h)
+        ssm_output = self.norm(h)
 
-        B, T, D = h.shape
+        # Get raw boundary probabilities
+        raw_probs, temperature = self.scorer(ssm_output)
 
-        if T < 2:
-            zeros = torch.zeros(B, T, device=x.device, dtype=x.dtype)
-            return zeros, zeros, h
+        # Learned value backward for budget-constrained posteriors
+        boundary_probs, expected_chunks = self.learned_backward(
+            raw_probs, ssm_output, self.config.max_chunks
+        )
 
-        # Compute logits from SSM outputs (vectorized)
-        logits = lm_head(h)  # (B, T, vocab_size)
+        # Hard decisions with straight-through estimator
+        boundary_hard = (boundary_probs > 0.5).float()
+        boundary_decisions = boundary_hard + boundary_probs - boundary_probs.detach()
 
-        # Compute log probabilities for actual tokens (vectorized)
-        log_probs = F.log_softmax(logits, dim=-1)  # (B, T, vocab_size)
-        token_log_probs = torch.gather(
-            log_probs, dim=-1, index=input_ids.unsqueeze(-1)
-        ).squeeze(-1)  # (B, T)
+        # Train amortized predictor via distillation
+        cumsum = torch.cumsum(boundary_probs, dim=-1)
+        max_boundaries = self.config.max_chunks - 1
+        budget_frac = (max_boundaries - cumsum).clamp(min=0) / max(max_boundaries, 1)
+        position_frac = torch.arange(T, device=device, dtype=x.dtype) / max(T - 1, 1)
+        position_frac = position_frac.unsqueeze(0).expand(B, -1)
 
-        # Compute cumulative average log probability (likelihood)
-        # cumsum gives sum, divide by position+1 to get average
-        positions = torch.arange(1, T + 1, device=x.device, dtype=x.dtype).view(1, -1)  # (1, T)
-        cumsum_log_probs = torch.cumsum(token_log_probs, dim=-1)  # (B, T)
-        avg_log_probs = cumsum_log_probs / positions  # (B, T) - average log prob up to each position
+        amortized_probs = self.amortized(ssm_output, budget_frac, position_frac)
+        distill_loss = self.amortized.distillation_loss(amortized_probs, boundary_probs)
 
-        # Compute change in average log probability (likelihood change)
-        # Compare each position with the previous position's average
-        # Position 0 has no previous, so we start from position 1
-        prev_avg_log_probs = torch.cat(
-            [torch.zeros(B, 1, device=x.device, dtype=x.dtype), avg_log_probs[:, :-1]], dim=1
-        )  # (B, T)
-        likelihood_change = avg_log_probs - prev_avg_log_probs  # (B, T)
-        # Positive = likelihood increased (surprisal decreased) = no boundary
-        # Negative = likelihood decreased (surprisal increased) = boundary
+        # Entropy loss
+        eps = 1e-6
+        probs_for_entropy = boundary_probs[:, 1:]
+        entropy = -(
+            probs_for_entropy * torch.log(probs_for_entropy + eps) +
+            (1 - probs_for_entropy) * torch.log(1 - probs_for_entropy + eps)
+        )
+        entropy_loss = entropy.mean()
 
-        # Boundary signal: negative likelihood change (surprisal increase)
-        boundary_logits = -likelihood_change  # (B, T) - positive = boundary
-        boundary_logits[:, 0] = -1e6  # First position is never a boundary (large negative)
+        # Sparsity loss
+        k = min(self.config.max_chunks - 1, T - 1)
+        if k > 0 and T > 1:
+            sorted_probs, _ = torch.sort(probs_for_entropy, dim=-1, descending=True)
+            top_k_probs = sorted_probs[:, :k]
+            sparsity_loss = torch.relu(0.6 - top_k_probs.mean())
+        else:
+            sparsity_loss = torch.tensor(0.0, device=x.device)
 
-        # Compute soft boundary probabilities (differentiable)
-        boundary_probs = torch.sigmoid(boundary_logits)  # (B, T)
-
-        # Hard decision: boundary if likelihood decreases (surprisal increases)
-        # This will be used for forward pass, but gradients flow through boundary_probs
-        boundary_decisions_hard = (likelihood_change < 0).float()  # (B, T)
-        boundary_decisions_hard[:, 0] = 0.0  # First position is never a boundary
-
-        # Apply max_chunks constraint in a differentiable way
-        # Compute chunk assignments from soft probabilities first
-        chunk_ids_soft = torch.cumsum(boundary_probs, dim=-1)  # (B, T) - soft chunk assignments
-        
-        # Create mask to prevent exceeding max_chunks (differentiable)
-        # Use a smooth penalty: sigmoid((chunk_id - max_chunks) / temperature)
-        # This creates a soft mask that approaches 0 as chunk_id approaches max_chunks
-        temperature = 1.0  # Controls smoothness of the constraint
-        excess_penalty = torch.sigmoid((chunk_ids_soft - self.config.max_chunks + 1) / temperature)
-        # Invert so that excess_penalty is 0 when chunk_id < max_chunks, and approaches 1 when >= max_chunks
-        max_chunks_mask = 1.0 - excess_penalty  # (B, T) - 1.0 when safe, 0.0 when exceeding
-        
-        # Apply mask to boundary probabilities (differentiable)
-        boundary_probs_constrained = boundary_probs * max_chunks_mask
-
-        # For hard decisions, also apply max_chunks constraint
-        chunk_ids_hard = torch.cumsum(boundary_decisions_hard, dim=-1)  # (B, T)
-        excess_mask_hard = chunk_ids_hard >= self.config.max_chunks  # (B, T)
-        boundary_decisions_hard = boundary_decisions_hard * (~excess_mask_hard).float()
-
-        # Straight-through estimator: use hard decision in forward, soft in backward
-        # This allows gradients to flow through boundary_probs_constrained
-        boundary_decisions = boundary_decisions_hard + boundary_probs_constrained - boundary_probs_constrained.detach()
-
-        return boundary_logits, boundary_decisions, h
+        return (
+            boundary_probs,
+            boundary_decisions,
+            ssm_output,
+            expected_chunks,
+            distill_loss,
+            entropy_loss,
+            sparsity_loss,
+        )
 
     def compute_chunk_assignments(self, boundary_decisions: torch.Tensor) -> torch.Tensor:
-        """
-        Convert boundary decisions to chunk assignments via cumsum.
-
-        Args:
-            boundary_decisions: (B, T) binary boundary indicators
-
-        Returns:
-            chunk_ids: (B, T) chunk indices
-        """
+        """Convert boundary decisions to chunk IDs via cumsum."""
         return torch.cumsum(boundary_decisions, dim=-1)
 
     def step(
         self,
         token_embed: torch.Tensor,
-        prev_hidden: torch.Tensor,
         conv_states: List[torch.Tensor],
         ssm_states: List[torch.Tensor],
-        token_id: torch.Tensor,
-        prev_avg_log_prob: Optional[torch.Tensor],
-        prev_token_count: int,
-        lm_head: nn.Linear,
-    ) -> Tuple[bool, torch.Tensor, List[torch.Tensor], List[torch.Tensor], torch.Tensor, int]:
-        """
-        Incremental boundary detection for generation using surprisal.
-
-        Args:
-            token_embed: Current token embedding (B, D)
-            prev_hidden: Previous SSM hidden state (B, D)
-            conv_states: Previous conv states
-            ssm_states: Previous SSM states
-            token_id: Current token ID (B,)
-            prev_avg_log_prob: Previous average log probability (B,) or None
-            prev_token_count: Previous token count in current chunk
-            lm_head: Language model head
-
-        Returns:
-            is_boundary: Whether to start a new chunk
-            curr_hidden: Current SSM hidden output (B, D)
-            new_conv_states: Updated conv states
-            new_ssm_states: Updated SSM states
-            curr_avg_log_prob: Current average log probability (B,)
-            curr_token_count: Current token count
-        """
+        n_boundaries_so_far: int,
+        position: int,
+        expected_length: int,
+    ) -> Tuple[bool, torch.Tensor, List[torch.Tensor], List[torch.Tensor]]:
+        """Incremental boundary detection for generation."""
         h = token_embed
         new_conv_states = []
         new_ssm_states = []
@@ -177,44 +333,26 @@ class BoundaryDetector(nn.Module):
             new_conv_states.append(new_conv)
             new_ssm_states.append(new_ssm)
 
-        curr_hidden = self.norm(h)
+        ssm_output = self.norm(h)
 
-        # Compute logits from SSM output
-        logits = lm_head(curr_hidden)  # (B, vocab_size)
-        log_probs = F.log_softmax(logits, dim=-1)  # (B, vocab_size)
-        token_log_prob = torch.gather(
-            log_probs, dim=-1, index=token_id.unsqueeze(-1)
-        ).squeeze(-1)  # (B,)
+        max_boundaries = self.config.max_chunks - 1
+        budget_frac = (max_boundaries - n_boundaries_so_far) / max(max_boundaries, 1)
+        position_frac = position / max(expected_length - 1, 1)
 
-        # Compute new average log probability
-        curr_token_count = prev_token_count + 1
-        if prev_avg_log_prob is None:
-            # First token in chunk
-            curr_avg_log_prob = token_log_prob
-        else:
-            # Update running average: (prev_avg * prev_count + new_log_prob) / curr_count
-            curr_avg_log_prob = (prev_avg_log_prob * prev_token_count + token_log_prob) / curr_token_count
+        budget_tensor = torch.tensor([[budget_frac]], device=token_embed.device, dtype=token_embed.dtype)
+        position_tensor = torch.tensor([[position_frac]], device=token_embed.device, dtype=token_embed.dtype)
 
-        # Check if likelihood decreased (surprisal increased)
-        if prev_avg_log_prob is None:
-            # First token - no boundary
-            is_boundary = False
-        else:
-            # Boundary if average likelihood decreased
-            likelihood_change = curr_avg_log_prob - prev_avg_log_prob
-            is_boundary = (likelihood_change < 0).item() if likelihood_change.numel() == 1 else (likelihood_change[0] < 0).item()
+        boundary_prob = self.amortized(ssm_output, budget_tensor.squeeze(-1), position_tensor.squeeze(-1))
 
-        return (
-            is_boundary,
-            curr_hidden,
-            new_conv_states,
-            new_ssm_states,
-            curr_avg_log_prob,
-            curr_token_count,
-        )
+        can_place_boundary = n_boundaries_so_far < max_boundaries
+        is_boundary = can_place_boundary and (boundary_prob.item() > 0.5)
 
-    def get_initial_state(self, batch_size: int, device: torch.device):
-        """Get initial states for incremental boundary detection."""
+        return is_boundary, ssm_output, new_conv_states, new_ssm_states
+
+    def get_initial_state(
+        self, batch_size: int, device: torch.device
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Get initial SSM states for generation."""
         conv_states = []
         ssm_states = []
         for layer in self.ssm_layers:

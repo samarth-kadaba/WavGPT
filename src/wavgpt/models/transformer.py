@@ -1,3 +1,5 @@
+"""Chunk transformer and token predictor."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -11,7 +13,7 @@ from wavgpt.models.attention import MultiHeadAttention
 
 
 class TransformerLayer(nn.Module):
-    """Standard transformer layer."""
+    """Standard transformer layer with pre-norm."""
 
     def __init__(self, config: InfiniteContextConfig):
         super().__init__()
@@ -29,7 +31,10 @@ class TransformerLayer(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, mask: Optional[torch.Tensor] = None, is_causal: bool = False
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         normed = self.norm1(x)
         x = x + self.attn(normed, normed, normed, mask, is_causal)
@@ -38,12 +43,7 @@ class TransformerLayer(nn.Module):
 
 
 class ChunkTransformer(nn.Module):
-    """
-    Transformer over chunk embeddings with positional encoding.
-
-    This is the ONLY quadratic attention in the model.
-    Uses causal attention: chunk c can see chunks 0..c-1
-    """
+    """Transformer over chunk embeddings with causal attention."""
 
     def __init__(self, config: InfiniteContextConfig):
         super().__init__()
@@ -51,17 +51,29 @@ class ChunkTransformer(nn.Module):
         self.gradient_checkpointing = config.gradient_checkpointing
 
         self.pos_embed = nn.Embedding(config.max_chunks, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [TransformerLayer(config) for _ in range(config.n_chunk_transformer_layers)]
-        )
+        self.layers = nn.ModuleList([
+            TransformerLayer(config)
+            for _ in range(config.n_chunk_transformer_layers)
+        ])
         self.norm = nn.LayerNorm(config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, chunk_embeddings: torch.Tensor, chunk_mask: torch.Tensor) -> torch.Tensor:
-        """Apply causal transformer attention over chunks."""
-        B, N, D = chunk_embeddings.shape
+    def forward(
+        self, chunk_embeddings: torch.Tensor, chunk_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply causal transformer attention over chunks.
+        
+        Args:
+            chunk_embeddings: (B, K, D) chunk representations
+            chunk_mask: (B, K) which chunks are active
+            
+        Returns:
+            contextualized_chunks: (B, K, D) chunks with global context
+        """
+        B, K, D = chunk_embeddings.shape
 
-        positions = torch.arange(N, device=chunk_embeddings.device)
+        positions = torch.arange(K, device=chunk_embeddings.device)
         x = chunk_embeddings + self.pos_embed(positions)
         x = self.dropout(x)
 
@@ -75,16 +87,11 @@ class ChunkTransformer(nn.Module):
 
 
 class TokenPredictor(nn.Module):
-    """
-    Predicts tokens by combining global (chunk) and local (SSM) context.
-
-    Uses differentiable soft chunk assignments to gather chunk context.
-    """
+    """Predicts tokens by combining global (chunk) and local (SSM) context."""
 
     def __init__(self, config: InfiniteContextConfig):
         super().__init__()
         self.config = config
-        self.soft_assign_temperature = config.soft_assign_temperature
 
         self.local_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
         self.combine = nn.Sequential(
@@ -101,43 +108,35 @@ class TokenPredictor(nn.Module):
         ssm_outputs: torch.Tensor,
         chunk_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute token-level representations using soft assignments.
-
-        CAUSALITY FIX: Only use PREVIOUS chunks (not current chunk) for global context.
-        The current chunk's embedding contains info from future tokens within that chunk,
-        which would leak information during training. The local context (SSM outputs)
-        handles within-chunk causal information.
+        """
+        Compute token-level hidden states for LM head.
+        
+        Args:
+            contextualized_chunks: (B, K, D) from ChunkTransformer
+            ssm_outputs: (B, T, D) per-token SSM outputs
+            chunk_ids: (B, T) chunk index for each token
+            
+        Returns:
+            token_hidden: (B, T, D) combined representations for each token
         """
         B, T, D = ssm_outputs.shape
-        n_chunks = contextualized_chunks.size(1)
+        K = contextualized_chunks.size(1)
         device = ssm_outputs.device
         dtype = ssm_outputs.dtype
 
-        # Soft assignment weights - CAUSAL: only attend to PREVIOUS chunks
-        chunk_indices = torch.arange(n_chunks, device=device, dtype=dtype)
+        chunk_indices = torch.arange(K, device=device, dtype=dtype)
         chunk_ids_expanded = chunk_ids.unsqueeze(-1)
         chunk_indices_expanded = chunk_indices.view(1, 1, -1)
 
-        # Mask out current and future chunks (only use chunks < current chunk)
-        # chunk_indices < chunk_ids means we only look at previous chunks
-        causal_mask = (chunk_indices_expanded < chunk_ids_expanded).float()  # (B, T, n_chunks)
-
-        # Distance-based soft attention for smooth gradient flow
+        causal_mask = (chunk_indices_expanded < chunk_ids_expanded).float()
         dist = (chunk_ids_expanded - chunk_indices_expanded).abs()
-        temp = self.soft_assign_temperature
-        assignment_weights = torch.exp(-dist / temp) * causal_mask
+        weights = torch.exp(-dist * 2.0) * causal_mask
 
-        # Normalize (add small constant to handle case where no previous chunks exist)
-        weight_sum = assignment_weights.sum(dim=-1, keepdim=True)
-        assignment_weights = assignment_weights / (weight_sum + 1e-8)
+        weight_sum = weights.sum(dim=-1, keepdim=True)
+        weights = weights / (weight_sum + 1e-8)
 
-        # Gather global context from PREVIOUS chunks only
-        global_context = torch.einsum("btc,bcd->btd", assignment_weights, contextualized_chunks)
+        global_context = torch.einsum("btk,bkd->btd", weights, contextualized_chunks)
 
-        # For tokens in the first chunk (no previous chunks), global context is zero
-        # This is correct - they only have local context
-
-        # Build local context (shifted for causal)
         local_context = torch.zeros(B, T, D, device=device, dtype=dtype)
         local_context[:, 0] = self.local_init
         local_context[:, 1:] = ssm_outputs[:, :-1]

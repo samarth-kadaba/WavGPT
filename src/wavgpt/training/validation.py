@@ -1,3 +1,5 @@
+"""Validation utilities for Infinite Context Transformer."""
+
 from __future__ import annotations
 
 from typing import Dict
@@ -27,15 +29,16 @@ def validate(
         use_amp: Use automatic mixed precision
 
     Returns:
-        Dictionary with validation metrics (val_loss, val_lm_loss, etc.)
+        Dictionary with validation metrics
     """
     model.eval()
     use_amp = use_amp and device == "cuda"
 
     total_loss = 0.0
     total_lm_loss = 0.0
-    total_comp_loss = 0.0
+    total_distill_loss = 0.0
     total_chunks = 0.0
+    total_expected_chunks = 0.0
     num_batches = 0
 
     for batch_idx, batch in enumerate(val_loader):
@@ -65,9 +68,10 @@ def validate(
             else:
                 total_lm_loss += outputs["loss"].item()
 
-            if outputs.get("compression_loss") is not None:
-                total_comp_loss += outputs["compression_loss"].item()
+            if outputs.get("distillation_loss") is not None:
+                total_distill_loss += outputs["distillation_loss"].item()
 
+            # Actual chunks
             n_chunks = outputs["n_chunks"]
             if isinstance(n_chunks, torch.Tensor):
                 total_chunks += n_chunks.item()
@@ -75,6 +79,16 @@ def validate(
                 total_chunks += sum(n_chunks) / len(n_chunks)
             else:
                 total_chunks += n_chunks
+
+            # Expected chunks from learned value function
+            expected_chunks = outputs.get("expected_chunks")
+            if expected_chunks is not None:
+                if isinstance(expected_chunks, torch.Tensor):
+                    total_expected_chunks += expected_chunks.item()
+                else:
+                    total_expected_chunks += expected_chunks
+            else:
+                total_expected_chunks += total_chunks
 
             num_batches += 1
 
@@ -89,11 +103,17 @@ def validate(
     model.train()
 
     if num_batches == 0:
-        return {"val_loss": float("inf"), "val_lm_loss": float("inf")}
+        return {
+            "val_loss": float("inf"),
+            "val_lm_loss": float("inf"),
+            "val_avg_chunks": 0.0,
+            "val_expected_chunks": 0.0,
+        }
 
     return {
         "val_loss": total_loss / num_batches,
         "val_lm_loss": total_lm_loss / num_batches,
-        "val_comp_loss": total_comp_loss / num_batches,
+        "val_distill_loss": total_distill_loss / num_batches,
         "val_avg_chunks": total_chunks / num_batches,
+        "val_expected_chunks": total_expected_chunks / num_batches,
     }

@@ -1,14 +1,14 @@
 [project]
 name = "wavgpt"
 version = "0.1.0"
-description = "Decodable Embeddings via Wavelet Compression and ANN Refinement"
+description = "Infinite Context Transformer with Learnable Chunking"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
-keywords = ["wavelet", "compression", "gpt", "transformer", "nlp"]
+keywords = ["transformer", "long-context", "chunking", "ssm", "nlp", "language-model"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
@@ -41,8 +41,7 @@ dev = [
     "ruff>=0.0.260",
 ]
 
-# Scripts can be run directly with: python scripts/train.py or python scripts/analyze.py
-# Entry points require the scripts directory to be a package, so we'll use direct execution instead
+# Scripts can be run directly with: python scripts/train.py or python scripts/evaluate.py
 
 [build-system]
 requires = ["hatchling"]

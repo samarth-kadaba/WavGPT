@@ -1,19 +1,4 @@
-"""
-Infinite Context Transformer with SSM-Guided Chunking.
-
-This package provides efficient long-context modeling through:
-1. Boundary SSM: Global pass to detect semantic chunk boundaries
-2. Chunk SSM: Fresh per-chunk compression (no cross-contamination)
-3. Chunk Transformer: O(chunks²) causal attention over chunk embeddings
-4. Token Predictor: Combines global (chunks) + local (within-chunk) context
-
-Key insight: By chunking at semantic boundaries and applying
-attention over chunks (not tokens), we achieve 100K+ token
-context with O(T) + O(chunks²) complexity.
-
-Each chunk is compressed INDEPENDENTLY, maintaining maximum
-resolution even for chunks late in the sequence.
-"""
+"""Infinite Context Transformer with Learnable Chunking."""
 
 __version__ = "2.0.0"
 

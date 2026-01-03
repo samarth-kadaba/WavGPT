@@ -1,20 +1,4 @@
-"""
-Infinite Context Transformer with SSM-Guided Chunking.
-
-Architecture:
-1. Token embeddings (no positional encoding at token level)
-2. Boundary SSM: Global O(n) pass to detect semantic chunk boundaries
-3. Chunk SSM: Per-chunk compression with boundary gating
-4. Chunk Transformer: O(chunks²) causal attention - the ONLY quadratic operation
-5. Token Predictor: Combines global (chunk) + local (within-chunk SSM) context
-6. Output projection to vocabulary
-
-Key Design Principles:
-- Boundary detection uses classifier (2-class: boundary vs no-boundary)
-- Differentiable via Gumbel-Softmax with Straight-Through Estimator
-- Soft chunk assignments enable gradient flow from LM loss to boundary detector
-- Generation uses learned boundaries with incremental state updates
-"""
+"""Infinite Context Transformer with Learnable Chunking."""
 
 from __future__ import annotations
 
@@ -24,59 +8,36 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from mamba_ssm import Mamba  # noqa: F401
-
-    HAS_MAMBA = True
-except ImportError:
-    HAS_MAMBA = False
-    Mamba = None  # type: ignore
-
 from wavgpt.models.config import InfiniteContextConfig, GenerationState
 from wavgpt.models.boundary import BoundaryDetector
 from wavgpt.models.compressor import ChunkCompressor
 from wavgpt.models.transformer import ChunkTransformer, TokenPredictor
 
 
-def _can_use_mamba() -> bool:
-    """Check if Mamba can be used (requires CUDA)."""
-    return HAS_MAMBA and torch.cuda.is_available()
-
-
 class InfiniteContextTransformer(nn.Module):
-    """
-    Infinite Context Transformer with SSM-Guided Chunking.
-
-    Architecture:
-    1. Token embeddings (no positional encoding)
-    2. Boundary detection: Classifier-based with Gumbel-Softmax
-    3. Chunk compression: Soft aggregation with boundary gating
-    4. Chunk transformer: O(chunks²) causal attention
-    5. Token prediction: Global + Local context
-
-    Complexity: O(T) + O(chunks²) where chunks ≤ max_chunks
-    """
+    """Infinite Context Transformer with learnable chunking."""
 
     def __init__(self, config: InfiniteContextConfig):
         super().__init__()
         self.config = config
 
+        # Token embeddings
         self.token_embed = nn.Embedding(config.vocab_size, config.hidden_size)
         self.embed_dropout = nn.Dropout(config.dropout)
 
+        # Core components
         self.boundary_detector = BoundaryDetector(config)
         self.chunk_compressor = ChunkCompressor(config)
         self.chunk_transformer = ChunkTransformer(config)
         self.token_predictor = TokenPredictor(config)
 
+        # LM head with weight tying
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.lm_head.weight = self.token_embed.weight  # Weight tying
+        self.lm_head.weight = self.token_embed.weight
 
         self.apply(self._init_weights)
 
-        # No need to initialize classifier bias anymore - using surprisal-based detection
-
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -90,14 +51,14 @@ class InfiniteContextTransformer(nn.Module):
         labels: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         """
-        Forward pass with fully differentiable boundary learning.
-
+        Forward pass with learnable chunking.
+        
         Args:
             input_ids: Token IDs (B, T)
             labels: Target labels for LM loss (B, T)
-
+            
         Returns:
-            Dictionary with logits, loss, and diagnostics
+            Dictionary with logits, losses, and diagnostics
         """
         B, T = input_ids.shape
 
@@ -105,35 +66,40 @@ class InfiniteContextTransformer(nn.Module):
         x = self.token_embed(input_ids)
         x = self.embed_dropout(x)
 
-        # 2. Boundary detection (surprisal-based, differentiable)
-        boundary_logits, boundary_decisions, boundary_hidden = self.boundary_detector(
-            x, input_ids, self.lm_head
-        )
+        # Boundary detection
+        (
+            boundary_probs,
+            boundary_decisions,
+            boundary_ssm_out,
+            expected_chunks,
+            distill_loss,
+            entropy_loss,
+            sparsity_loss,
+        ) = self.boundary_detector(x)
 
-        # 3. Compute chunk assignments via cumsum
+        # Compute chunk assignments
         chunk_ids = self.boundary_detector.compute_chunk_assignments(boundary_decisions)
 
-        # 4. Chunk compression with soft assignments
+        # Chunk compression
         chunk_embeddings, chunk_mask, ssm_outputs, n_chunks = self.chunk_compressor(
-            x, chunk_ids, boundary_decisions
+            x, chunk_ids, boundary_probs
         )
 
-        # 5. Chunk transformer
+        # Chunk transformer
         contextualized_chunks = self.chunk_transformer(chunk_embeddings, chunk_mask)
 
-        # 6. Token prediction
+        # Token prediction
         token_hidden = self.token_predictor(contextualized_chunks, ssm_outputs, chunk_ids)
 
-        # 7. Output logits
+        # LM head
         logits = self.lm_head(token_hidden)
 
-        # Compute loss with compression regularization
-        # Boundary detector learns through gradient flow:
-        # LM loss → token_hidden → TokenPredictor → soft_assignment_weights → chunk_ids → boundary_decisions
+        # Compute losses
         loss = None
         lm_loss = None
-        compression_loss = None
+
         if labels is not None:
+            # LM loss (shifted)
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             lm_loss = F.cross_entropy(
@@ -142,24 +108,25 @@ class InfiniteContextTransformer(nn.Module):
                 ignore_index=-100,
             )
 
-            # Compression loss: directly penalize boundaries
-            # boundary_decisions is soft (from Gumbel-Softmax), so gradients flow strongly
-            # Higher compression_weight = fewer chunks = more compression
-            compression_loss = boundary_decisions.mean()
-
-            loss = lm_loss + self.config.compression_weight * compression_loss
-
-        # Diagnostic info
-        chunk_ranges = self.boundary_detector.compute_chunk_assignments(boundary_decisions)
+            # Total loss
+            loss = (
+                lm_loss
+                + self.config.distillation_weight * distill_loss
+                + self.config.entropy_weight * entropy_loss
+                + self.config.sparsity_weight * sparsity_loss
+            )
 
         return {
             "logits": logits,
             "loss": loss,
             "lm_loss": lm_loss,
-            "compression_loss": compression_loss,
-            "boundary_probs": boundary_decisions,
+            "distillation_loss": distill_loss,
+            "entropy_loss": entropy_loss,
+            "sparsity_loss": sparsity_loss,
+            "boundary_probs": boundary_probs,
             "n_chunks": n_chunks,
-            "chunk_ranges": chunk_ranges,
+            "expected_chunks": expected_chunks.mean() if expected_chunks is not None else n_chunks,
+            "chunk_ids": chunk_ids,
         }
 
     @torch.no_grad()
@@ -171,7 +138,7 @@ class InfiniteContextTransformer(nn.Module):
         top_k: Optional[int] = 50,
         top_p: Optional[float] = 0.9,
     ) -> torch.Tensor:
-        """Generate tokens autoregressively (simple version, re-runs full forward)."""
+        """Generate tokens autoregressively."""
         self.eval()
 
         for _ in range(max_new_tokens):
@@ -208,119 +175,118 @@ class InfiniteContextTransformer(nn.Module):
         top_k: Optional[int] = 50,
         top_p: Optional[float] = 0.9,
     ) -> torch.Tensor:
-        """
-        Efficient generation with state caching and learned boundary detection.
-
-        Uses classifier decision (logit > 0 = boundary) for chunk commits.
-        """
+        """Efficient generation with state caching and amortized boundary predictor."""
         self.eval()
         B = input_ids.shape[0]
         assert B == 1, "Efficient generation currently supports batch_size=1"
         device = input_ids.device
+        T_prompt = input_ids.size(1)
 
-        # Initial forward pass
+        # Process prompt
         x = self.token_embed(input_ids)
         x = self.embed_dropout(x)
 
-        # Get boundaries and chunk assignments
-        boundary_logits, boundary_decisions, boundary_hidden = self.boundary_detector(
-            x, input_ids, self.lm_head
-        )
+        # Detect boundaries
+        (
+            boundary_probs,
+            boundary_decisions,
+            boundary_ssm_out,
+            expected_chunks,
+            _,  # distill_loss
+            _,  # entropy_loss
+            _,  # sparsity_loss
+        ) = self.boundary_detector(x)
         chunk_ids = self.boundary_detector.compute_chunk_assignments(boundary_decisions)
 
-        # Initialize state
+        # Initialize generation state
         state = GenerationState()
 
-        # Process prompt chunks using the regular forward (fully vectorized)
+        # Process prompt chunks
         chunk_embeds, chunk_mask, ssm_outputs, n_chunks = self.chunk_compressor(
-            x, chunk_ids, boundary_decisions
+            x, chunk_ids, boundary_probs
         )
 
-        # n_chunks is a tensor (average), get max active chunks from mask for this sample
+        # Get active chunks
         active_chunks = int(chunk_mask[0].sum().item())
         state.committed_chunk_embeds = [chunk_embeds[0, i] for i in range(active_chunks)]
+        state.n_boundaries = active_chunks - 1 if active_chunks > 0 else 0
 
+        # Contextualize committed chunks
         if state.committed_chunk_embeds:
             committed = torch.stack(state.committed_chunk_embeds).unsqueeze(0)
             mask = torch.ones(1, len(state.committed_chunk_embeds), device=device)
             state.committed_chunk_contextualized = self.chunk_transformer(committed, mask)
         else:
-            state.committed_chunk_embeds = [torch.zeros(self.config.hidden_size, device=device)]
+            # Initialize with zeros if no chunks yet
+            state.committed_chunk_embeds = [
+                torch.zeros(self.config.hidden_size, device=device)
+            ]
             committed = torch.stack(state.committed_chunk_embeds).unsqueeze(0)
             mask = torch.ones(1, 1, device=device)
             state.committed_chunk_contextualized = self.chunk_transformer(committed, mask)
 
         # Initialize SSM states
-        state.chunk_conv_states, state.chunk_ssm_states = self.chunk_compressor.get_initial_state(
-            1, device
+        state.chunk_conv_states, state.chunk_ssm_states = (
+            self.chunk_compressor.get_initial_state(1, device)
         )
-        state.current_ssm_output = self.token_predictor.local_init.detach().clone()  # (D,)
-        state.current_chunk_size = 0
-
         state.boundary_conv_states, state.boundary_ssm_states = (
             self.boundary_detector.get_initial_state(1, device)
         )
-
-        # Initialize surprisal tracking state
-        state.boundary_prev_hidden = None
-        state.boundary_prev_avg_log_prob = None
-        state.boundary_token_count = 0
-
-        # Warm up boundary detector with last chunk (if exists)
-        if chunk_ids.max() > 0:
-            # Find last chunk tokens
-            last_chunk_id = chunk_ids[0, -1].item()
-            last_chunk_mask = chunk_ids[0] == last_chunk_id
-            last_chunk_token_ids = input_ids[0][last_chunk_mask]
-            last_chunk_embeds = x[0][last_chunk_mask]
-
-            # Process last chunk tokens to warm up state
-            for t in range(last_chunk_embeds.size(0)):
-                tok_embed = last_chunk_embeds[t : t + 1]  # (1, D)
-                token_id = last_chunk_token_ids[t : t + 1]  # (1,)
-                
-                if state.boundary_prev_hidden is None:
-                    prev_hidden = torch.zeros(1, self.config.hidden_size, device=device)
-                else:
-                    prev_hidden = state.boundary_prev_hidden
-
-                (
-                    _,
-                    state.boundary_prev_hidden,
-                    state.boundary_conv_states,
-                    state.boundary_ssm_states,
-                    state.boundary_prev_avg_log_prob,
-                    state.boundary_token_count,
-                ) = self.boundary_detector.step(
-                    tok_embed,
-                    prev_hidden,
-                    state.boundary_conv_states,
-                    state.boundary_ssm_states,
-                    token_id,
-                    state.boundary_prev_avg_log_prob,
-                    state.boundary_token_count,
-                    self.lm_head,
+        
+        # Find last chunk start position
+        last_chunk_id = int(chunk_ids[0, -1].item())
+        last_chunk_start = 0
+        for t in range(T_prompt):
+            if int(chunk_ids[0, t].item()) == last_chunk_id:
+                last_chunk_start = t
+                break
+        
+        # Warm up SSM states with last chunk tokens
+        state.current_ssm_output = self.token_predictor.local_init.detach().clone()
+        state.current_chunk_size = 0
+        
+        for t in range(last_chunk_start, T_prompt):
+            tok_embed = x[0, t:t+1, :]
+            
+            ssm_out, state.chunk_conv_states, state.chunk_ssm_states = (
+                self.chunk_compressor.step(
+                    tok_embed, state.chunk_conv_states, state.chunk_ssm_states
                 )
-        else:
-            state.boundary_prev_hidden = torch.zeros(1, self.config.hidden_size, device=device)
-            state.boundary_prev_avg_log_prob = None
-            state.boundary_token_count = 0
+            )
+            state.current_ssm_output = ssm_out.squeeze(0) if ssm_out.dim() > 1 else ssm_out
+            state.current_chunk_size += 1
+            
+            _, _, state.boundary_conv_states, state.boundary_ssm_states = (
+                self.boundary_detector.step(
+                    tok_embed,
+                    state.boundary_conv_states,
+                    state.boundary_ssm_states,
+                    state.n_boundaries,
+                    t,
+                    T_prompt + max_new_tokens,
+                )
+            )
+        
+        state.position = T_prompt
+        expected_length = T_prompt + max_new_tokens
 
         # Generate tokens
         for _ in range(max_new_tokens):
-            global_ctx = state.committed_chunk_contextualized[0, -1]  # (D,)
-            local_ctx = state.current_ssm_output  # (D,) or (1, D)
+            # Get context for prediction
+            global_ctx = state.committed_chunk_contextualized[0, -1]
+            local_ctx = state.current_ssm_output
 
-            # Ensure both are 1D tensors of shape (D,)
             if local_ctx.dim() == 2:
                 local_ctx = local_ctx.squeeze(0)
             if global_ctx.dim() == 2:
                 global_ctx = global_ctx.squeeze(0)
 
-            combined = torch.cat([global_ctx, local_ctx], dim=-1).unsqueeze(0)  # (1, 2D)
+            # Combine contexts
+            combined = torch.cat([global_ctx, local_ctx], dim=-1).unsqueeze(0)
             token_hidden = self.token_predictor.combine(combined)
             token_hidden = self.token_predictor.norm(token_hidden)
 
+            # Sample next token
             logits = self.lm_head(token_hidden).squeeze(0) / temperature
 
             if top_k is not None:
@@ -340,68 +306,52 @@ class InfiniteContextTransformer(nn.Module):
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-
             input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
 
+            # Update state with new token
             tok_embed = self.token_embed(next_token.unsqueeze(0)).squeeze(1)
 
-            # Update chunk compressor state
-            ssm_out, state.chunk_conv_states, state.chunk_ssm_states = self.chunk_compressor.step(
-                tok_embed, state.chunk_conv_states, state.chunk_ssm_states
+            # Update chunk compressor SSM
+            ssm_out, state.chunk_conv_states, state.chunk_ssm_states = (
+                self.chunk_compressor.step(
+                    tok_embed, state.chunk_conv_states, state.chunk_ssm_states
+                )
             )
-            # ssm_out is (B, D) where B=1, squeeze to (D,)
-            state.current_ssm_output = ssm_out.view(-1) if ssm_out.dim() > 1 else ssm_out
+            state.current_ssm_output = ssm_out.squeeze(0) if ssm_out.dim() > 1 else ssm_out
             state.current_chunk_size += 1
+            state.position += 1
 
-            # Check for boundary (surprisal-based decision)
-            if state.boundary_prev_hidden is None:
-                prev_hidden = torch.zeros(1, self.config.hidden_size, device=device)
-            else:
-                prev_hidden = state.boundary_prev_hidden
-
-            (
-                is_boundary,
-                curr_hidden,
-                state.boundary_conv_states,
-                state.boundary_ssm_states,
-                state.boundary_prev_avg_log_prob,
-                state.boundary_token_count,
-            ) = self.boundary_detector.step(
-                tok_embed,
-                prev_hidden,
-                state.boundary_conv_states,
-                state.boundary_ssm_states,
-                next_token,
-                state.boundary_prev_avg_log_prob,
-                state.boundary_token_count,
-                self.lm_head,
-            )
-            state.boundary_prev_hidden = curr_hidden
-
-            # Commit chunk if boundary detected (respecting min_chunk_size)
-            should_commit = (
-                state.current_chunk_size >= self.config.min_chunk_size
-                and is_boundary
-                and len(state.committed_chunk_embeds) < self.config.max_chunks
+            # Check for boundary
+            is_boundary, _, state.boundary_conv_states, state.boundary_ssm_states = (
+                self.boundary_detector.step(
+                    tok_embed,
+                    state.boundary_conv_states,
+                    state.boundary_ssm_states,
+                    state.n_boundaries,
+                    state.position,
+                    expected_length,
+                )
             )
 
-            if should_commit:
+            # Commit chunk if boundary detected
+            if is_boundary and len(state.committed_chunk_embeds) < self.config.max_chunks:
                 chunk_embed = self.chunk_compressor.chunk_proj(state.current_ssm_output)
                 state.committed_chunk_embeds.append(chunk_embed)
+                state.n_boundaries += 1
 
+                # Re-contextualize chunks
                 committed = torch.stack(state.committed_chunk_embeds).unsqueeze(0)
                 mask = torch.ones(1, len(state.committed_chunk_embeds), device=device)
-                state.committed_chunk_contextualized = self.chunk_transformer(committed, mask)
+                state.committed_chunk_contextualized = self.chunk_transformer(
+                    committed, mask
+                )
 
+                # Reset chunk state
                 state.current_chunk_size = 0
                 state.chunk_conv_states, state.chunk_ssm_states = (
                     self.chunk_compressor.get_initial_state(1, device)
                 )
-                state.current_ssm_output = self.token_predictor.local_init.detach().clone()  # (D,)
-                
-                # Reset boundary detector state for new chunk
-                state.boundary_prev_avg_log_prob = None
-                state.boundary_token_count = 0
+                state.current_ssm_output = self.token_predictor.local_init.detach().clone()
 
         return input_ids
 

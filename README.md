@@ -1,17 +1,17 @@
 # WavGPT
 
-Decodable Embeddings via Wavelet Compression and ANN Refinement
+Infinite Context Transformer with Learnable Chunking
 
 ## Overview
 
-WavGPT is a research project that explores wavelet-based compression techniques for transformer language models. The project implements a hybrid approach combining learnable wavelet transforms with learned frequency filtering and hidden state refinement networks.
+WavGPT implements an efficient long-context transformer that learns to segment sequences into semantic chunks, enabling processing of 100K+ token contexts with O(T) + O(K²) complexity, where T is sequence length and K is the maximum number of chunks.
 
 ## Features
 
-- **Learnable Wavelet Transforms**: Uses a learnable lifting scheme initialized to Haar wavelets
-- **Learned Frequency Filtering**: Automatically learns which frequency components are important
-- **Hidden State Refinement**: Refines compressed hidden states using transformer-based refinement networks
-- **Comprehensive Analysis Tools**: Includes visualization and analysis utilities for understanding learned frequency patterns
+- **Learnable Boundary Detection**: O(T) learned value function for optimal chunk segmentation
+- **SSM-Based Compression**: State Space Models compress tokens within chunks
+- **Chunk Transformer**: O(K²) causal attention over chunk embeddings (the only quadratic operation)
+- **Efficient Generation**: Amortized boundary predictor for O(1) per-token decisions
 
 ## Installation
 
@@ -51,43 +51,39 @@ source .venv/bin/activate  # On Unix/macOS
 
 ### Training
 
-Train a WavGPT model:
+Train a model:
 
 ```bash
 python scripts/train.py
 ```
 
-Or use the installed command:
+With custom parameters:
+
 ```bash
-wavgpt-train
+python scripts/train.py --epochs 5 --batch-size 4 --max-length 16384
+python scripts/train.py --hidden-size 768 --n-heads 12 --max-chunks 512
+```
+
+### Evaluation
+
+Evaluate a trained model:
+
+```bash
+python scripts/evaluate.py --checkpoint path/to/checkpoint.pt
+python scripts/evaluate.py --generate --prompt "Your prompt here"
 ```
 
 ### Configuration
 
-Edit `src/wavgpt/config.py` to modify training hyperparameters:
+Edit `src/wavgpt/config.py` to modify default hyperparameters:
 
-- `MODEL_NAME`: Base language model (default: "bert-large-uncased")
-- `BLOCK_SIZE`: Sequence length (must be power of 2, default: 256)
-- `BATCH_SIZE`: Training batch size (default: 8)
-- `KEEP_RATIO`: Fraction of wavelet coefficients to keep (default: 1/256)
-- `LEARNING_RATE`: Learning rate (default: 5e-4)
+- `HIDDEN_SIZE`: Model hidden dimension (default: 768)
+- `N_HEADS`: Number of attention heads (default: 12)
+- `MAX_CHUNKS`: Maximum number of chunks K (default: 256)
+- `BATCH_SIZE`: Training batch size (default: 2)
+- `MAX_LENGTH`: Maximum sequence length (default: 8192)
+- `LEARNING_RATE`: Learning rate (default: 1e-4)
 - `NUM_EPOCHS`: Number of training epochs (default: 3)
-- `TEMPERATURE`: Temperature for knowledge distillation (default: 2.0)
-
-**Note**: WavGPT uses BERT (bidirectional model) instead of GPT-2 (causal model) to enable true decodable embeddings. With BERT, hidden state `h[i]` represents token `[i]` directly, allowing perfect reconstruction without needing to store the first token separately. 
-
-### Analysis
-
-Run analysis on a trained model:
-
-```bash
-python scripts/analyze.py
-```
-
-Or use the installed command:
-```bash
-wavgpt-analyze
-```
 
 ## Project Structure
 
@@ -96,35 +92,38 @@ WavGPT/
 ├── src/
 │   └── wavgpt/
 │       ├── __init__.py
-│       ├── models.py          # Model definitions
-│       ├── data.py             # Data loading utilities
-│       ├── training.py         # Training functions
-│       ├── analysis.py          # Analysis and visualization
-│       └── config.py           # Configuration constants
+│       ├── config.py           # Configuration constants
+│       ├── models/              # Model components
+│       │   ├── core.py          # Main transformer model
+│       │   ├── boundary.py      # Boundary detection
+│       │   ├── compressor.py    # Chunk compression
+│       │   ├── transformer.py   # Chunk transformer
+│       │   └── s4.py            # SSM layers
+│       ├── data/                # Data loading
+│       └── training/            # Training utilities
 ├── scripts/
 │   ├── train.py                # Training script
-│   └── analyze.py              # Analysis script
-├── tests/                      # Test files (to be added)
-├── pyproject.toml              # Project configuration and dependencies
+│   └── evaluate.py             # Evaluation script
+├── tests/                       # Test files
+├── pyproject.toml              # Project configuration
 └── README.md                   # This file
 ```
 
 ## Model Architecture
 
-The model consists of three main components:
+The model consists of four main components:
 
-1. **CompressedWaveletEmbedding**: Performs learnable wavelet transform on hidden states
-2. **LearnedFrequencyFilterBank**: Learns which frequency components to keep
-3. **HiddenStateRefinementNetwork**: Refines compressed hidden states using transformer layers
+1. **BoundaryDetector**: Learns to detect semantic chunk boundaries using O(T) learned value function
+2. **ChunkCompressor**: Compresses tokens within chunks using SSM layers
+3. **ChunkTransformer**: Applies causal attention over chunk embeddings (O(K²))
+4. **TokenPredictor**: Combines global (chunk) and local (SSM) context for token prediction
 
-### Why BERT Instead of GPT-2?
+### Complexity
 
-WavGPT uses BERT (bidirectional) rather than GPT-2 (causal) for a fundamental architectural reason:
-
-- **GPT-2 (Causal)**: Hidden state `h[i]` predicts token `[i+1]` (next token). Cannot reconstruct the current sequence without storing the first token separately.
-- **BERT (Bidirectional)**: Hidden state `h[i]` represents token `[i]` directly. Allows perfect reconstruction from compressed hidden states alone.
-
-This makes BERT the natural choice for decodable embeddings where you want to compress text → hidden states → wavelet coefficients and then decompress back to the original text.
+- Boundary detection: O(T) via learned value function
+- Chunk compression: O(T) via SSM processing
+- Chunk transformer: O(K²) causal attention
+- **Total**: O(T) + O(K²) where K ≤ max_chunks
 
 ## Citation
 
@@ -132,7 +131,7 @@ If you use this code in your research, please cite:
 
 ```bibtex
 @software{wavgpt,
-  title={WavGPT: Decodable Embeddings via Wavelet Compression and ANN Refinement},
+  title={WavGPT: Infinite Context Transformer with Learnable Chunking},
   author={Your Name},
   year={2024},
   url={https://github.com/samarth-kadaba/WavGPT}
@@ -149,6 +148,5 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Acknowledgments
 
-- Original research on wavelet compression for transformers
 - HuggingFace Transformers library
 - PyTorch team

@@ -91,14 +91,14 @@ def analyze_chunks(model, tokenizer, text, device, max_length=1024):
     with torch.no_grad():
         outputs = model(input_ids=tokens)
 
-    n_chunks = outputs["n_chunks"]  # This is an int, not a list
-    chunk_ranges = outputs["chunk_ranges"][0]
+    n_chunks = outputs["n_chunks"]
     boundary_probs = outputs["boundary_probs"]
+    chunk_ids = outputs["chunk_ids"]
 
     return {
         "n_chunks": n_chunks,
-        "chunk_ranges": chunk_ranges,
         "boundary_probs": boundary_probs,
+        "chunk_ids": chunk_ids,
         "tokens": tokens,
     }
 
@@ -183,16 +183,12 @@ def main():
             "chunk_analysis_result",
             text_preview=text[:50],
             n_chunks=result["n_chunks"],
-            chunk_ranges=result["chunk_ranges"][:5],
         )
 
     # Boundary parameters
     logger.info("boundary_parameters")
     detector = model.boundary_detector
-    logger.info(
-        "boundary_params",
-        decision_rule="surprisal-based: boundary when likelihood decreases",
-    )
+    logger.info("boundary_params")
 
     # Generation
     if args.generate:

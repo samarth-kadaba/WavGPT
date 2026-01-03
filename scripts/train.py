@@ -1,28 +1,18 @@
 #!/usr/bin/env python3
-"""
-Training script for Infinite Context Transformer.
-
-Architecture:
-1. Boundary SSM: Global O(n) pass to detect semantic chunk boundaries
-2. Chunk SSM: Fresh per-chunk compression (no cross-contamination)
-3. Chunk Transformer: O(chunks²) causal attention - only quadratic operation
-4. Token Predictor: Combines global (chunks) + local (within-chunk) context
-
-Complexity: O(T) + O(chunks²), where chunks ≤ 1024
-
-Usage:
-    python scripts/train.py
-    python scripts/train.py --epochs 5 --batch-size 4
-    python scripts/train.py --hidden-size 768 --n-heads 12
-"""
+"""Training script for Infinite Context Transformer with Learnable Chunking."""
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 import structlog
 import torch
 from transformers import AutoTokenizer
+
+# Configure torch.compile cache to avoid filling disk
+# Use a temp directory that can be cleaned, and disable FX graph cache
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "0")  # Disable persistent FX cache
 
 try:
     import wandb
@@ -45,7 +35,6 @@ from wavgpt.config import (  # noqa: E402
     N_BOUNDARY_LAYERS,
     N_CHUNK_SSM_LAYERS,
     N_CHUNK_TRANSFORMER_LAYERS,
-    MIN_CHUNK_SIZE,
     MAX_CHUNKS,
     BATCH_SIZE,
     LEARNING_RATE,
@@ -62,6 +51,7 @@ from wavgpt.config import (  # noqa: E402
     MIN_SEQ_LENGTH,
     VAL_RATIO,
     TEST_RATIO,
+    DISTILLATION_WEIGHT,
 )
 
 # Configure structlog for console output (after imports)
@@ -72,13 +62,17 @@ logger = structlog.get_logger()
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Train Infinite Context Transformer",
+        description="Train Infinite Context Transformer with Learnable Chunking",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Training parameters
-    parser.add_argument("--epochs", type=int, default=NUM_EPOCHS, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Training batch size")
+    parser.add_argument(
+        "--epochs", type=int, default=NUM_EPOCHS, help="Number of training epochs"
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=BATCH_SIZE, help="Training batch size"
+    )
     parser.add_argument("--lr", type=float, default=LEARNING_RATE, help="Learning rate")
     parser.add_argument(
         "--grad-accum",
@@ -94,7 +88,9 @@ def parse_args():
     parser.add_argument(
         "--hidden-size", type=int, default=HIDDEN_SIZE, help="Model hidden dimension"
     )
-    parser.add_argument("--n-heads", type=int, default=N_HEADS, help="Number of attention heads")
+    parser.add_argument(
+        "--n-heads", type=int, default=N_HEADS, help="Number of attention heads"
+    )
     parser.add_argument(
         "--n-boundary-layers",
         type=int,
@@ -114,20 +110,18 @@ def parse_args():
         help="Number of chunk transformer layers",
     )
 
-    # Chunking parameters
-    # NOTE: No max-chunk-size! Chunks can be arbitrarily large.
-    # Only constraint is max-chunks (≤1024 chunks to transformer)
-    parser.add_argument(
-        "--min-chunk",
-        type=int,
-        default=MIN_CHUNK_SIZE,
-        help="Minimum chunk size (prevent tiny chunks)",
-    )
+    # Chunking parameters (budget constraint)
     parser.add_argument(
         "--max-chunks",
         type=int,
         default=MAX_CHUNKS,
-        help="Maximum number of chunks (the ONLY size constraint)",
+        help="Maximum number of chunks (budget constraint K)",
+    )
+    parser.add_argument(
+        "--distillation-weight",
+        type=float,
+        default=DISTILLATION_WEIGHT,
+        help="Weight for amortized predictor distillation loss",
     )
 
     # Logging and saving
@@ -135,18 +129,29 @@ def parse_args():
         "--log-interval", type=int, default=LOG_INTERVAL, help="Steps between logging"
     )
     parser.add_argument(
-        "--save-interval", type=int, default=SAVE_INTERVAL, help="Steps between checkpoints"
+        "--save-interval",
+        type=int,
+        default=SAVE_INTERVAL,
+        help="Steps between checkpoints",
     )
     parser.add_argument(
-        "--val-interval", type=int, default=VAL_INTERVAL, help="Steps between validation runs"
+        "--val-interval",
+        type=int,
+        default=VAL_INTERVAL,
+        help="Steps between validation runs",
     )
     parser.add_argument(
-        "--val-batches", type=int, default=50, help="Number of batches to use for validation"
+        "--val-batches", type=int, default=50, help="Number of batches for validation"
     )
     parser.add_argument(
-        "--save-dir", type=str, default=CHECKPOINT_DIR, help="Directory for saving checkpoints"
+        "--save-dir",
+        type=str,
+        default=CHECKPOINT_DIR,
+        help="Directory for saving checkpoints",
     )
-    parser.add_argument("--no-wandb", action="store_true", help="Disable Weights & Biases logging")
+    parser.add_argument(
+        "--no-wandb", action="store_true", help="Disable Weights & Biases logging"
+    )
     parser.add_argument(
         "--resume", type=str, default=None, help="Path to checkpoint to resume from"
     )
@@ -154,7 +159,9 @@ def parse_args():
         "--no-validation", action="store_true", help="Disable validation during training"
     )
     parser.add_argument(
-        "--save-best-only", action="store_true", help="Only save best model (saves disk space)"
+        "--save-best-only",
+        action="store_true",
+        help="Only save best model (saves disk space)",
     )
 
     # Dataset parameters
@@ -165,23 +172,25 @@ def parse_args():
         choices=["c4", "wikitext", "wikipedia", "gutenberg", "code", "arxiv"],
         help="Dataset to train on",
     )
-    parser.add_argument("--no-concat", action="store_true", help="Disable document concatenation")
+    parser.add_argument(
+        "--no-concat", action="store_true", help="Disable document concatenation"
+    )
     parser.add_argument(
         "--fixed-length",
         action="store_true",
-        help="Use fixed sequence length instead of variable (default: variable)",
+        help="Use fixed sequence length instead of variable",
     )
     parser.add_argument(
         "--val-ratio",
         type=float,
         default=VAL_RATIO,
-        help="Fraction of data for validation (default: 0.05)",
+        help="Fraction of data for validation",
     )
     parser.add_argument(
         "--test-ratio",
         type=float,
         default=TEST_RATIO,
-        help="Fraction of data for testing (default: 0.05)",
+        help="Fraction of data for testing",
     )
 
     # Memory optimization
@@ -201,7 +210,10 @@ def parse_args():
         help="Disable torch.compile (enabled by default for speed)",
     )
     parser.add_argument(
-        "--num-workers", type=int, default=4, help="DataLoader workers for parallel data loading"
+        "--num-workers",
+        type=int,
+        default=4,
+        help="DataLoader workers for parallel data loading",
     )
 
     return parser.parse_args()
@@ -220,8 +232,8 @@ def main():
         n_boundary_layers=args.n_boundary_layers,
         n_chunk_ssm_layers=args.n_chunk_ssm_layers,
         n_chunk_transformer_layers=args.n_chunk_transformer_layers,
-        min_chunk_size=args.min_chunk,
         max_chunks=args.max_chunks,
+        distillation_weight=args.distillation_weight,
         max_length=args.max_length,
         batch_size=args.batch_size,
         gradient_accumulation=args.grad_accum,
@@ -250,7 +262,7 @@ def main():
             config=vars(args),
         )
 
-    # Load tokenizer (use GPT-2 tokenizer)
+    # Load tokenizer
     logger.info("loading_tokenizer")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     if tokenizer.pad_token is None:
@@ -266,8 +278,8 @@ def main():
         n_boundary_layers=args.n_boundary_layers,
         n_chunk_ssm_layers=args.n_chunk_ssm_layers,
         n_chunk_transformer_layers=args.n_chunk_transformer_layers,
-        min_chunk_size=args.min_chunk,
-        max_chunks=args.max_chunks,  # The ONLY size constraint
+        max_chunks=args.max_chunks,
+        distillation_weight=args.distillation_weight,
         dropout=DROPOUT,
         gradient_checkpointing=args.gradient_checkpointing,
     )
@@ -296,7 +308,7 @@ def main():
             num_workers=args.num_workers,
             val_ratio=args.val_ratio,
             test_ratio=args.test_ratio,
-            include_test=False,  # Don't create test loader during training
+            include_test=False,
         )
         train_loader = dataloaders["train"]
         val_loader = dataloaders["val"]
@@ -323,7 +335,6 @@ def main():
     logger.info("optimizer_created", optimizer="AdamW", learning_rate=args.lr)
 
     # Create scheduler
-    # Estimate steps per epoch
     estimated_steps = 100000 // (args.batch_size * args.grad_accum)
     scheduler = create_scheduler(
         optimizer,
@@ -336,7 +347,9 @@ def main():
         logger.info("resuming_from_checkpoint", checkpoint=args.resume)
         checkpoint_info = load_checkpoint(model, optimizer, scheduler, args.resume)
         logger.info(
-            "checkpoint_loaded", epoch=checkpoint_info["epoch"], step=checkpoint_info["step"]
+            "checkpoint_loaded",
+            epoch=checkpoint_info["epoch"],
+            step=checkpoint_info["step"],
         )
 
     # Create save directory
@@ -364,11 +377,11 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         use_wandb=use_wandb,
         save_dir=str(save_dir),
-        use_amp=not args.no_amp,  # Mixed precision (default: enabled)
-        compile_model=not args.no_compile,  # torch.compile (default: enabled)
-        val_loader=val_loader,  # Validation dataloader
-        val_batches=args.val_batches,  # Number of validation batches
-        save_best_only=args.save_best_only,  # Only save best model
+        use_amp=not args.no_amp,
+        compile_model=not args.no_compile,
+        val_loader=val_loader,
+        val_batches=args.val_batches,
+        save_best_only=args.save_best_only,
     )
 
     logger.info("training_complete")

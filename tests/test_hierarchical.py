@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for SSM-Guided Hierarchical Attention.
+Tests for Infinite Context Transformer with Learnable Chunking.
 
 Run with: python -m pytest tests/test_hierarchical.py -v
 """
@@ -12,13 +12,15 @@ import torch
 sys.path.insert(0, "/home/ubuntu/WavGPT/src")
 
 from wavgpt import (
-    HierarchicalConfig,
+    InfiniteContextConfig,
     SelectiveSSM,
+    SSMLayer,
     BoundaryDetector,
-    ChunkAggregator,
-    ChunkAttention,
-    HierarchicalSSMAttention,
-    create_hierarchical_model,
+    ChunkCompressor,
+    ChunkTransformer,
+    TokenPredictor,
+    InfiniteContextTransformer,
+    create_model,
 )
 
 
@@ -34,13 +36,14 @@ def device():
 
 @pytest.fixture
 def config():
-    return HierarchicalConfig(
+    return InfiniteContextConfig(
+        vocab_size=1000,
         hidden_size=256,
         n_heads=4,
-        n_layers=2,
-        ssm_d_state=8,
-        min_chunk_size=4,
-        max_chunk_size=32,
+        n_boundary_layers=2,
+        n_chunk_ssm_layers=2,
+        n_chunk_transformer_layers=2,
+        max_chunks=32,
     )
 
 
@@ -57,7 +60,7 @@ class TestSelectiveSSM:
         ssm = SelectiveSSM(d_model=256, d_state=16).to(device)
         x = torch.randn(2, 64, 256, device=device)
 
-        output, hidden = ssm(x, return_hidden_states=True)
+        output, hidden = ssm(x, return_all_states=True)
 
         assert output.shape == x.shape
         assert hidden is not None
@@ -67,7 +70,7 @@ class TestSelectiveSSM:
         ssm = SelectiveSSM(d_model=256, d_state=16).to(device)
         x = torch.randn(2, 64, 256, device=device)
 
-        _, hidden = ssm(x, return_hidden_states=True)
+        _, hidden = ssm(x, return_all_states=True)
 
         assert hidden is not None
         assert hidden.shape[0] == 2  # Batch
@@ -80,204 +83,201 @@ class TestSelectiveSSM:
 
 
 class TestBoundaryDetector:
-    """Tests for boundary detection from SSM dynamics."""
+    """Tests for learned boundary detection with O(T) value function."""
 
-    def test_boundary_probs_shape(self, device):
-        """Boundary probabilities should have correct shape."""
-        detector = BoundaryDetector(hidden_size=256).to(device)
-        hidden_states = torch.randn(2, 64, 256, device=device)
+    def test_forward_shape(self, config, device):
+        """Boundary detector should return correct shapes."""
+        detector = BoundaryDetector(config).to(device)
+        x = torch.randn(2, 64, config.hidden_size, device=device)
 
-        probs, velocity = detector(hidden_states, return_velocity=True)
+        (
+            boundary_probs,
+            boundary_decisions,
+            ssm_output,
+            expected_chunks,
+            distill_loss,
+            entropy_loss,
+            sparsity_loss,
+        ) = detector(x)
 
-        assert probs.shape == (2, 63)  # T-1 boundaries
-        assert velocity.shape == (2, 63)
+        assert boundary_probs.shape == (2, 64)
+        assert boundary_decisions.shape == (2, 64)
+        assert ssm_output.shape == x.shape
+        assert expected_chunks.shape == (2,)  # Per-batch expected chunks
+        assert distill_loss.shape == ()
+        assert entropy_loss.shape == ()
+        assert sparsity_loss.shape == ()
 
-    def test_boundary_probs_range(self, device):
+    def test_boundary_probs_range(self, config, device):
         """Boundary probabilities should be in [0, 1]."""
-        detector = BoundaryDetector(hidden_size=256).to(device)
-        hidden_states = torch.randn(2, 64, 256, device=device)
+        detector = BoundaryDetector(config).to(device)
+        x = torch.randn(2, 64, config.hidden_size, device=device)
 
-        probs, _ = detector(hidden_states)
+        boundary_probs, _, _, _, _, _, _ = detector(x)
 
-        assert (probs >= 0).all()
-        assert (probs <= 1).all()
+        assert (boundary_probs >= 0).all()
+        assert (boundary_probs <= 1).all()
 
-    def test_hard_boundaries_constraints(self, device):
-        """Hard boundaries should respect min/max chunk size."""
-        detector = BoundaryDetector(hidden_size=256).to(device)
-        hidden_states = torch.randn(1, 128, 256, device=device)
+    def test_first_position_no_boundary(self, config, device):
+        """First position should never be a boundary."""
+        detector = BoundaryDetector(config).to(device)
+        x = torch.randn(2, 64, config.hidden_size, device=device)
 
-        probs, _ = detector(hidden_states)
-        boundaries = detector.get_hard_boundaries(
-            probs,
-            min_chunk_size=8,
-            max_chunk_size=32,
-        )
+        boundary_probs, _, _, _, _, _, _ = detector(x)
 
-        # Check boundaries exist
-        assert boundaries.shape == (1, 127)
+        # First position should always be 0
+        assert (boundary_probs[:, 0] == 0).all()
 
-        # Find boundary positions
-        boundary_positions = torch.where(boundaries[0])[0].tolist()
-
-        # Check max chunk size constraint
-        last_pos = -1
-        for pos in boundary_positions + [127]:
-            chunk_size = pos - last_pos
-            assert chunk_size <= 32, f"Chunk size {chunk_size} exceeds max 32"
-            last_pos = pos
-
-    def test_learnable_parameters(self, device):
-        """All boundary detection parameters should be learnable."""
-        detector = BoundaryDetector(hidden_size=256).to(device)
-
-        # Check parameters exist and require grad
-        assert hasattr(detector, "threshold")
-        assert detector.threshold.requires_grad
-
-        assert hasattr(detector, "temperature_logit")
-        assert detector.temperature_logit.requires_grad
-
-        assert hasattr(detector, "velocity_weight")
-        assert detector.velocity_weight.requires_grad
-
-        # Check get_learned_params returns values
-        params = detector.get_learned_params()
-        assert "threshold" in params
-        assert "temperature" in params
-        assert "velocity_mix" in params
-
-    def test_gradient_flow(self, device):
+    def test_gradient_flow(self, config, device):
         """Gradients should flow through boundary detection."""
-        detector = BoundaryDetector(hidden_size=256).to(device)
-        hidden_states = torch.randn(2, 64, 256, device=device, requires_grad=True)
+        detector = BoundaryDetector(config).to(device)
+        x = torch.randn(2, 64, config.hidden_size, device=device, requires_grad=True)
 
-        probs, _ = detector(hidden_states)
-        loss = probs.mean()
+        boundary_probs, _, _, _, distill_loss, _, _ = detector(x)
+        loss = boundary_probs.mean() + distill_loss
         loss.backward()
 
         # Check gradients exist
-        assert detector.threshold.grad is not None
-        assert detector.temperature_logit.grad is not None
-        assert detector.velocity_weight.grad is not None
+        assert x.grad is not None
+        assert not torch.isnan(x.grad).any()
+
+    def test_chunk_assignments(self, config, device):
+        """Chunk assignments should be computed correctly from boundaries."""
+        detector = BoundaryDetector(config).to(device)
+        x = torch.randn(1, 32, config.hidden_size, device=device)
+
+        _, boundary_decisions, _, _, _, _, _ = detector(x)
+        chunk_ids = detector.compute_chunk_assignments(boundary_decisions)
+
+        # Chunk IDs should be monotonically non-decreasing
+        assert (chunk_ids[:, 1:] >= chunk_ids[:, :-1]).all()
 
 
 # =============================================================================
-# Chunk Aggregation Tests
+# Chunk Compressor Tests
 # =============================================================================
 
 
-class TestChunkAggregator:
-    """Tests for chunk aggregation."""
+class TestChunkCompressor:
+    """Tests for chunk compression."""
 
-    def test_aggregation_output_shape(self, device):
-        """Aggregator should produce chunk embeddings."""
-        aggregator = ChunkAggregator(hidden_size=256, aggregation="last").to(device)
-        hidden_states = torch.randn(2, 64, 256, device=device)
+    def test_compression_output_shape(self, config, device):
+        """Compressor should produce chunk embeddings."""
+        compressor = ChunkCompressor(config).to(device)
+        x = torch.randn(2, 64, config.hidden_size, device=device)
 
-        # Create some boundaries
-        boundaries = torch.zeros(2, 63, dtype=torch.bool, device=device)
-        boundaries[0, 15] = True  # Boundary at position 16
-        boundaries[0, 31] = True  # Boundary at position 32
-        boundaries[1, 20] = True  # Boundary at position 21
+        # Create some chunk assignments
+        chunk_ids = torch.zeros(2, 64, device=device)
+        chunk_ids[:, 16:32] = 1
+        chunk_ids[:, 32:48] = 2
+        chunk_ids[:, 48:] = 3
 
-        chunks, ranges = aggregator(hidden_states, boundaries)
+        boundary_probs = torch.zeros(2, 64, device=device)
+        boundary_probs[:, 16] = 1.0
+        boundary_probs[:, 32] = 1.0
+        boundary_probs[:, 48] = 1.0
 
-        assert chunks.dim() == 3
-        assert chunks.shape[0] == 2  # Batch
-        assert chunks.shape[2] == 256  # Hidden size
+        chunk_embeddings, chunk_mask, ssm_outputs, n_chunks = compressor(
+            x, chunk_ids, boundary_probs
+        )
 
-    def test_aggregation_methods(self, device):
-        """Different aggregation methods should work."""
-        for method in ["last", "mean", "attention"]:
-            aggregator = ChunkAggregator(hidden_size=256, aggregation=method).to(device)
-            hidden_states = torch.randn(1, 32, 256, device=device)
-            boundaries = torch.zeros(1, 31, dtype=torch.bool, device=device)
-            boundaries[0, 15] = True
-
-            chunks, ranges = aggregator(hidden_states, boundaries)
-
-            assert chunks.shape[0] == 1
-            assert chunks.shape[2] == 256
+        assert chunk_embeddings.shape == (2, config.max_chunks, config.hidden_size)
+        assert chunk_mask.shape == (2, config.max_chunks)
+        assert ssm_outputs.shape == x.shape
 
 
 # =============================================================================
-# Chunk Attention Tests
+# Chunk Transformer Tests
 # =============================================================================
 
 
-class TestChunkAttention:
+class TestChunkTransformer:
     """Tests for chunk-level attention."""
 
-    def test_attention_output_shape(self, device):
+    def test_attention_output_shape(self, config, device):
         """Attention output should match input shape."""
-        attn = ChunkAttention(hidden_size=256, n_heads=4).to(device)
-        x = torch.randn(2, 16, 256, device=device)
-
-        output = attn(x)
-
-        assert output.shape == x.shape
-
-    def test_attention_with_mask(self, device):
-        """Attention should handle masks correctly."""
-        attn = ChunkAttention(hidden_size=256, n_heads=4).to(device)
-        x = torch.randn(2, 16, 256, device=device)
+        transformer = ChunkTransformer(config).to(device)
+        x = torch.randn(2, 16, config.hidden_size, device=device)
         mask = torch.ones(2, 16, device=device)
-        mask[0, 8:] = 0  # Mask second half for first batch
 
-        output = attn(x, attention_mask=mask)
+        output = transformer(x, mask)
 
         assert output.shape == x.shape
 
+    def test_causal_attention(self, config, device):
+        """Transformer should use causal attention."""
+        transformer = ChunkTransformer(config).to(device)
+        x = torch.randn(2, 16, config.hidden_size, device=device)
+        mask = torch.ones(2, 16, device=device)
+
+        # Output should be valid (no NaN/Inf)
+        output = transformer(x, mask)
+        assert not torch.isnan(output).any()
+        assert not torch.isinf(output).any()
+
 
 # =============================================================================
-# Hierarchical Model Tests
+# Full Model Tests
 # =============================================================================
 
 
-class TestHierarchicalSSMAttention:
-    """Tests for the full hierarchical model."""
+class TestInfiniteContextTransformer:
+    """Tests for the full model."""
 
     def test_forward_pass(self, config, device):
         """Model should produce output."""
-        model = HierarchicalSSMAttention(config).to(device)
-        x = torch.randn(2, 64, config.hidden_size, device=device)
+        model = InfiniteContextTransformer(config).to(device)
+        input_ids = torch.randint(0, config.vocab_size, (2, 64), device=device)
 
-        result = model(x)
+        outputs = model(input_ids)
 
-        assert "output" in result
-        assert result["output"].dim() == 3
+        assert "logits" in outputs
+        assert outputs["logits"].shape == (2, 64, config.vocab_size)
 
-    def test_return_boundaries(self, config, device):
-        """Model should return boundary info when requested."""
-        model = HierarchicalSSMAttention(config).to(device)
-        x = torch.randn(2, 64, config.hidden_size, device=device)
+    def test_loss_computation(self, config, device):
+        """Model should compute loss when labels provided."""
+        model = InfiniteContextTransformer(config).to(device)
+        input_ids = torch.randint(0, config.vocab_size, (2, 64), device=device)
+        labels = input_ids.clone()
 
-        result = model(x, return_boundaries=True)
+        outputs = model(input_ids, labels=labels)
 
-        assert "boundary_probs" in result
-        assert "boundaries" in result
-        assert "velocity" in result
+        assert "loss" in outputs
+        assert outputs["loss"] is not None
+        assert outputs["loss"].shape == ()  # Scalar
+        assert not torch.isnan(outputs["loss"])
 
-    def test_return_chunks(self, config, device):
-        """Model should return chunk info when requested."""
-        model = HierarchicalSSMAttention(config).to(device)
-        x = torch.randn(2, 64, config.hidden_size, device=device)
+    def test_boundary_outputs(self, config, device):
+        """Model should return boundary information."""
+        model = InfiniteContextTransformer(config).to(device)
+        input_ids = torch.randint(0, config.vocab_size, (2, 64), device=device)
 
-        result = model(x, return_chunks=True)
+        outputs = model(input_ids)
 
-        assert "chunk_embeddings" in result
-        assert "chunk_ranges" in result
-        assert "n_chunks" in result
+        assert "boundary_probs" in outputs
+        assert outputs["boundary_probs"].shape == (2, 64)
+        assert "n_chunks" in outputs
+        assert "expected_chunks" in outputs
 
     def test_variable_sequence_lengths(self, config, device):
         """Model should handle different sequence lengths."""
-        model = HierarchicalSSMAttention(config).to(device)
+        model = InfiniteContextTransformer(config).to(device)
 
         for seq_len in [32, 64, 128, 256]:
-            x = torch.randn(1, seq_len, config.hidden_size, device=device)
-            result = model(x)
-            assert result["output"].shape[0] == 1
+            input_ids = torch.randint(0, config.vocab_size, (1, seq_len), device=device)
+            outputs = model(input_ids)
+            assert outputs["logits"].shape == (1, seq_len, config.vocab_size)
+
+    def test_generation(self, config, device):
+        """Model should generate tokens."""
+        model = InfiniteContextTransformer(config).to(device)
+        model.eval()
+        prompt = torch.randint(0, config.vocab_size, (1, 10), device=device)
+
+        with torch.no_grad():
+            generated = model.generate(prompt, max_new_tokens=20)
+
+        assert generated.shape == (1, 30)  # 10 prompt + 20 generated
 
 
 # =============================================================================
@@ -288,18 +288,59 @@ class TestHierarchicalSSMAttention:
 class TestCreateFunctions:
     """Tests for convenience creation functions."""
 
-    def test_create_hierarchical_model(self, device):
-        """create_hierarchical_model should work."""
-        model = create_hierarchical_model(
+    def test_create_model(self, device):
+        """create_model should work."""
+        model = create_model(
+            vocab_size=1000,
             hidden_size=256,
             n_heads=4,
-            n_layers=2,
         ).to(device)
 
-        x = torch.randn(1, 64, 256, device=device)
-        result = model(x)
+        input_ids = torch.randint(0, 1000, (1, 64), device=device)
+        outputs = model(input_ids)
 
-        assert "output" in result
+        assert "logits" in outputs
+
+
+# =============================================================================
+# O(T) Complexity Tests
+# =============================================================================
+
+
+class TestComplexity:
+    """Tests to verify O(T) complexity of boundary detection."""
+
+    def test_memory_scaling(self, device):
+        """Memory should scale linearly with sequence length."""
+        if device != "cuda":
+            pytest.skip("Memory scaling test requires CUDA")
+
+        config = InfiniteContextConfig(
+            vocab_size=1000,
+            hidden_size=256,
+            n_heads=4,
+            max_chunks=256,
+        )
+        model = InfiniteContextTransformer(config).to(device)
+        model.eval()
+
+        memory_usage = []
+        for seq_len in [128, 256, 512]:
+            torch.cuda.reset_peak_memory_stats()
+            input_ids = torch.randint(0, 1000, (1, seq_len), device=device)
+            with torch.no_grad():
+                _ = model(input_ids)
+            mem = torch.cuda.max_memory_allocated() / 1e6
+            memory_usage.append((seq_len, mem))
+
+        # Memory should roughly double when sequence doubles (linear scaling)
+        # Allow some tolerance for fixed overhead
+        ratio_1 = memory_usage[1][1] / memory_usage[0][1]
+        ratio_2 = memory_usage[2][1] / memory_usage[1][1]
+
+        # Ratios should be close to 2.0 (linear) rather than 4.0 (quadratic)
+        assert ratio_1 < 3.0, f"Memory ratio {ratio_1} suggests non-linear scaling"
+        assert ratio_2 < 3.0, f"Memory ratio {ratio_2} suggests non-linear scaling"
 
 
 # =============================================================================

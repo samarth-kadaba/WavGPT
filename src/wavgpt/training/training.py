@@ -141,12 +141,27 @@ def train(
                     with autocast(device_type="cuda"):
                         outputs = model(input_ids=input_ids, labels=labels)
                         loss = outputs["loss"] / gradient_accumulation_steps
-
-                    # Backward pass with scaled gradients
-                    scaler.scale(loss).backward()
                 else:
                     outputs = model(input_ids=input_ids, labels=labels)
                     loss = outputs["loss"] / gradient_accumulation_steps
+
+                # NaN detection: skip batch if loss is NaN or Inf
+                if torch.isnan(loss) or torch.isinf(loss):
+                    logger.warning(
+                        "nan_loss_detected",
+                        batch=batch_idx,
+                        step=global_step,
+                        loss=loss.item() if not torch.isnan(loss) else "NaN",
+                    )
+                    optimizer.zero_grad()
+                    if device == "cuda":
+                        torch.cuda.empty_cache()
+                    continue
+
+                # Backward pass
+                if use_amp:
+                    scaler.scale(loss).backward()
+                else:
                     loss.backward()
 
                 accumulated_loss += loss.item()
@@ -156,11 +171,30 @@ def train(
                 if accumulation_counter >= gradient_accumulation_steps:
                     if use_amp:
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+                    
+                    # Check for NaN gradients before clipping
+                    has_nan_grad = False
+                    for param in model.parameters():
+                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                            has_nan_grad = True
+                            break
+                    
+                    if has_nan_grad:
+                        logger.warning("nan_gradient_detected", step=global_step)
+                        optimizer.zero_grad()
+                        if use_amp:
+                            scaler.update()  # Still update scaler to adjust scale factor
+                        accumulated_loss = 0.0
+                        accumulation_counter = 0
+                        continue
+
+                    # Clip gradients to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
+
+                    if use_amp:
                         scaler.step(optimizer)
                         scaler.update()
                     else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD_NORM)
                         optimizer.step()
 
                     optimizer.zero_grad()
@@ -197,31 +231,41 @@ def train(
 
                     # Logging
                     if global_step % log_interval == 0:
-                        # Get LM loss and compression loss if available
+                        # Get LM loss
                         lm_loss = outputs.get("lm_loss")
                         lm_loss_val = lm_loss.item() if lm_loss is not None else accumulated_loss
-                        comp_loss = outputs.get("compression_loss")
-                        comp_loss_val = comp_loss.item() if comp_loss is not None else 0.0
+                        
+                        expected_chunks = outputs.get("expected_chunks")
+                        expected_chunks_val = expected_chunks.item() if expected_chunks is not None else avg_chunks
 
                         logger.info(
                             "training_step",
                             step=global_step,
                             loss=accumulated_loss,
                             lm_loss=lm_loss_val,
-                            comp_loss=comp_loss_val,
                             avg_chunks=avg_chunks,
+                            expected_chunks=expected_chunks_val,
                             boundary_mean_prob=mean_boundary_prob,
                             tokens_millions=total_tokens / 1e6,
                         )
 
                         if use_wandb:
+                            # Get auxiliary losses
+                            entropy_loss = outputs.get("entropy_loss")
+                            sparsity_loss = outputs.get("sparsity_loss")
+                            distill_loss = outputs.get("distillation_loss")
+                            
                             log_dict = {
                                 "loss": accumulated_loss,
                                 "lm_loss": lm_loss_val,
                                 "avg_chunks": avg_chunks,
+                                "expected_chunks": expected_chunks_val,
                                 "learning_rate": optimizer.param_groups[0]["lr"],
                                 "epoch": epoch,
                                 "boundary/mean_prob": mean_boundary_prob,
+                                "boundary/entropy_loss": entropy_loss.item() if entropy_loss is not None else 0.0,
+                                "boundary/sparsity_loss": sparsity_loss.item() if sparsity_loss is not None else 0.0,
+                                "boundary/distill_loss": distill_loss.item() if distill_loss is not None else 0.0,
                                 "total_tokens": total_tokens,
                                 "tokens_millions": total_tokens / 1e6,
                             }
@@ -254,8 +298,8 @@ def train(
                             step=global_step,
                             val_loss=val_metrics["val_loss"],
                             val_lm_loss=val_metrics["val_lm_loss"],
-                            val_comp_loss=val_metrics["val_comp_loss"],
                             val_avg_chunks=val_metrics["val_avg_chunks"],
+                            val_expected_chunks=val_metrics["val_expected_chunks"],
                         )
 
                         if use_wandb:
