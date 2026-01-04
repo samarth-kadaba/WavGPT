@@ -46,7 +46,10 @@ def parse_args():
     )
     parser.add_argument("--max-tokens", type=int, default=100, help="Maximum tokens to generate")
     parser.add_argument(
-        "--efficient", action="store_true", help="Use efficient generation with state caching"
+        "--skip-eval", action="store_true", help="Skip perplexity and chunk analysis (only generate)"
+    )
+    parser.add_argument(
+        "--cpu", action="store_true", help="Force CPU inference (useful when GPU is busy)"
     )
     return parser.parse_args()
 
@@ -103,44 +106,45 @@ def analyze_chunks(model, tokenizer, text, device, max_length=1024):
     }
 
 
-def generate_text(model, tokenizer, prompt, device, max_new_tokens=100, efficient=False):
-    """Generate text from a prompt."""
+def generate_text(model, tokenizer, prompt, device, max_new_tokens=100):
+    """Generate text from a prompt using full forward pass (matches training)."""
+    print(f"Generating text with prompt: {prompt[:50]}...", flush=True)
     tokens = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    print(f"Input tokens shape: {tokens.shape}", flush=True)
 
-    if efficient:
-        generated = model.generate_efficient(
-            tokens,
-            max_new_tokens=max_new_tokens,
-            temperature=0.8,
-            top_k=50,
-            top_p=0.9,
-        )
-    else:
-        generated = model.generate(
-            tokens,
-            max_new_tokens=max_new_tokens,
-            temperature=0.8,
-            top_k=50,
-            top_p=0.9,
-        )
+    print("Using standard generation (full forward pass, matches training)...", flush=True)
+    generated = model.generate(
+        tokens,
+        max_new_tokens=max_new_tokens,
+        temperature=0.8,
+        top_k=50,
+        top_p=0.9,
+    )
 
-    return tokenizer.decode(generated[0], skip_special_tokens=True)
+    print(f"Generated tokens shape: {generated.shape}", flush=True)
+    decoded = tokenizer.decode(generated[0], skip_special_tokens=True)
+    print(f"Decoded text length: {len(decoded)}", flush=True)
+    return decoded
 
 
 def main():
     args = parse_args()
+    print(f"Starting evaluation with args: {args}", flush=True)
 
-    logger.info("evaluation_start", device=DEVICE)
+    # Determine device
+    device = "cpu" if args.cpu else DEVICE
+    print(f"Using device: {device}", flush=True)
+    logger.info("evaluation_start", device=device)
 
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Create/load model
+    # Create/load model (load on CPU first to reduce GPU memory pressure)
     if args.checkpoint:
         logger.info("loading_checkpoint", checkpoint=args.checkpoint)
-        checkpoint = torch.load(args.checkpoint, map_location=DEVICE)
+        checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
         config = checkpoint.get("config")
         if config is None:
             config = InfiniteContextConfig(
@@ -157,53 +161,68 @@ def main():
         )
         model = InfiniteContextTransformer(config)
 
-    model = model.to(DEVICE)
+    # Move to device (loads on CPU first, then moves to GPU if needed)
+    model = model.to(device)
     model.eval()
+    
+    # Clear cache if using GPU (safe - only clears PyTorch cache, not other processes)
+    if device != "cpu" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     logger.info("model_loaded", parameters=model.get_num_params())
 
-    # Test texts
-    test_texts = [
-        "The quick brown fox jumps over the lazy dog. This is a classic pangram.",
-        "In machine learning, neural networks learn representations of data.",
-        "Climate change is one of the most pressing challenges facing humanity.",
-        "The history of computing spans from ancient abacuses to quantum computers.",
-    ]
+    # Skip expensive evaluations if only generating or if explicitly skipped
+    ppl = None
+    if not args.skip_eval and not args.generate:
+        # Test texts
+        test_texts = [
+            "The quick brown fox jumps over the lazy dog. This is a classic pangram.",
+            "In machine learning, neural networks learn representations of data.",
+            "Climate change is one of the most pressing challenges facing humanity.",
+            "The history of computing spans from ancient abacuses to quantum computers.",
+        ]
 
-    # Compute perplexity
-    logger.info("perplexity_evaluation")
-    ppl = compute_perplexity(model, tokenizer, test_texts, DEVICE)
-    logger.info("perplexity_result", perplexity=ppl)
+        # Compute perplexity
+        logger.info("perplexity_evaluation")
+        ppl = compute_perplexity(model, tokenizer, test_texts, device)
+        logger.info("perplexity_result", perplexity=ppl)
 
-    # Analyze chunks
-    logger.info("chunk_analysis")
-    for text in test_texts[:2]:
-        result = analyze_chunks(model, tokenizer, text, DEVICE)
-        logger.info(
-            "chunk_analysis_result",
-            text_preview=text[:50],
-            n_chunks=result["n_chunks"],
-        )
+        # Analyze chunks
+        logger.info("chunk_analysis")
+        for text in test_texts[:2]:
+            result = analyze_chunks(model, tokenizer, text, device)
+            logger.info(
+                "chunk_analysis_result",
+                text_preview=text[:50],
+                n_chunks=result["n_chunks"],
+            )
 
-    # Boundary parameters
-    logger.info("boundary_parameters")
-    detector = model.boundary_detector
-    logger.info("boundary_params")
+        # Boundary parameters
+        logger.info("boundary_parameters")
+        detector = model.boundary_detector
+        logger.info("boundary_params")
 
     # Generation
     if args.generate:
-        logger.info("text_generation", prompt=args.prompt, efficient=args.efficient)
+        print(f"\n{'='*60}", flush=True)
+        print(f"GENERATING TEXT", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        logger.info("text_generation", prompt=args.prompt)
         generated = generate_text(
-            model, tokenizer, args.prompt, DEVICE, args.max_tokens, efficient=args.efficient
+            model, tokenizer, args.prompt, device, args.max_tokens
         )
+        print(f"\n{'='*60}", flush=True)
+        print(f"PROMPT: {args.prompt}", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"GENERATED:\n{generated}", flush=True)
+        print(f"{'='*60}\n", flush=True)
         logger.info("generated_text", text=generated)
 
     # Summary
-    logger.info(
-        "evaluation_summary",
-        perplexity=ppl,
-        parameters=model.get_num_params(),
-    )
+    summary = {"parameters": model.get_num_params()}
+    if ppl is not None:
+        summary["perplexity"] = ppl
+    logger.info("evaluation_summary", **summary)
 
 
 if __name__ == "__main__":

@@ -90,6 +90,7 @@ def main():
         input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
 
         with torch.no_grad():
+            # Uses full forward pass (matches training exactly)
             output_ids = model.generate(
                 input_ids,
                 max_new_tokens=args.max_tokens,
@@ -110,8 +111,15 @@ def main():
     with torch.no_grad():
         x = model.token_embed(input_ids)
         x = model.embed_dropout(x)
-        boundary_logits, boundary_decisions, _ = model.boundary_detector(x, input_ids, model.lm_head)
-        boundary_probs = torch.sigmoid(boundary_logits)
+        # boundary_detector now returns 6 values (removed distill_loss)
+        (
+            boundary_probs,
+            boundary_decisions,
+            ssm_output,
+            expected_chunks,
+            entropy_loss,
+            sparsity_loss,
+        ) = model.boundary_detector(x)
 
     # Show boundary probabilities
     tokens = tokenizer.convert_ids_to_tokens(input_ids[0])

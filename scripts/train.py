@@ -51,7 +51,6 @@ from wavgpt.config import (  # noqa: E402
     MIN_SEQ_LENGTH,
     VAL_RATIO,
     TEST_RATIO,
-    DISTILLATION_WEIGHT,
 )
 
 # Configure structlog for console output (after imports)
@@ -117,13 +116,6 @@ def parse_args():
         default=MAX_CHUNKS,
         help="Maximum number of chunks (budget constraint K)",
     )
-    parser.add_argument(
-        "--distillation-weight",
-        type=float,
-        default=DISTILLATION_WEIGHT,
-        help="Weight for amortized predictor distillation loss",
-    )
-
     # Logging and saving
     parser.add_argument(
         "--log-interval", type=int, default=LOG_INTERVAL, help="Steps between logging"
@@ -233,7 +225,6 @@ def main():
         n_chunk_ssm_layers=args.n_chunk_ssm_layers,
         n_chunk_transformer_layers=args.n_chunk_transformer_layers,
         max_chunks=args.max_chunks,
-        distillation_weight=args.distillation_weight,
         max_length=args.max_length,
         batch_size=args.batch_size,
         gradient_accumulation=args.grad_accum,
@@ -279,7 +270,6 @@ def main():
         n_chunk_ssm_layers=args.n_chunk_ssm_layers,
         n_chunk_transformer_layers=args.n_chunk_transformer_layers,
         max_chunks=args.max_chunks,
-        distillation_weight=args.distillation_weight,
         dropout=DROPOUT,
         gradient_checkpointing=args.gradient_checkpointing,
     )

@@ -93,6 +93,8 @@ class TokenPredictor(nn.Module):
         super().__init__()
         self.config = config
 
+        # NOTE: local_init is kept for backward compatibility with old checkpoints
+        # but is no longer used - local_context now uses ssm_outputs directly
         self.local_init = nn.Parameter(torch.randn(config.hidden_size) * 0.02)
         self.combine = nn.Sequential(
             nn.Linear(config.hidden_size * 2, config.hidden_size),
@@ -130,16 +132,21 @@ class TokenPredictor(nn.Module):
 
         causal_mask = (chunk_indices_expanded < chunk_ids_expanded).float()
         dist = (chunk_ids_expanded - chunk_indices_expanded).abs()
-        weights = torch.exp(-dist * 2.0) * causal_mask
-
-        weight_sum = weights.sum(dim=-1, keepdim=True)
-        weights = weights / (weight_sum + 1e-8)
+        
+        # Use log-space softmax for numerical stability
+        log_weights = -dist * 1.5  # Reduced steepness for smoother gradients
+        log_weights = log_weights.clamp(min=-20)  # Prevent underflow
+        # Apply causal mask in log space (-inf for invalid positions)
+        log_weights = log_weights + (causal_mask - 1) * 1e4
+        weights = torch.softmax(log_weights, dim=-1) * causal_mask  # Extra mask for safety
 
         global_context = torch.einsum("btk,bkd->btd", weights, contextualized_chunks)
 
-        local_context = torch.zeros(B, T, D, device=device, dtype=dtype)
-        local_context[:, 0] = self.local_init
-        local_context[:, 1:] = ssm_outputs[:, :-1]
+        # Local context: SSM outputs contain info from tokens 0 to t
+        # For predicting token t+1, we need all info up to and including token t
+        # NOTE: DO NOT shift! ssm_outputs[t] already represents tokens 0:t+1
+        # which is exactly what we need for next-token prediction at position t
+        local_context = ssm_outputs
 
         combined = torch.cat([global_context, local_context], dim=-1)
         token_hidden = self.combine(combined)

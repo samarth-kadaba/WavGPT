@@ -9,7 +9,14 @@ from wavgpt.config import LEARNING_RATE, WARMUP_RATIO, DEVICE
 
 
 def create_optimizer(model, lr: float = LEARNING_RATE, weight_decay: float = 0.01):
-    """Create AdamW optimizer with weight decay."""
+    """
+    Create AdamW optimizer with GPT-2 style hyperparameters.
+    
+    GPT-2/3 training tricks:
+    - betas=(0.9, 0.95) instead of default (0.9, 0.999) for faster adaptation
+    - eps=1e-5 for better fp16 stability (default 1e-8 can underflow)
+    - Weight decay only on 2D params (no bias, norms, embeddings)
+    """
     # Separate parameters that should/shouldn't have weight decay
     decay_params = []
     no_decay_params = []
@@ -28,6 +35,8 @@ def create_optimizer(model, lr: float = LEARNING_RATE, weight_decay: float = 0.0
             {"params": no_decay_params, "weight_decay": 0.0},
         ],
         lr=lr,
+        betas=(0.9, 0.95),  # GPT-2/3 style betas
+        eps=1e-5,  # More stable for fp16
     )
 
 
@@ -92,7 +101,7 @@ def load_checkpoint(
     device: str = DEVICE,
 ) -> Dict[str, Any]:
     """Load training checkpoint."""
-    checkpoint = torch.load(path, map_location=device)
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 

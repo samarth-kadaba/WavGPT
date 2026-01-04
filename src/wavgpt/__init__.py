@@ -12,8 +12,6 @@ from wavgpt.models import (
     ChunkCompressor,
     ChunkTransformer,
     TokenPredictor,
-    # Generation
-    GenerationState,
     # Main model
     InfiniteContextTransformer,
     # Utilities
@@ -36,8 +34,6 @@ __all__ = [
     "ChunkCompressor",
     "ChunkTransformer",
     "TokenPredictor",
-    # Generation
-    "GenerationState",
     # Main model
     "InfiniteContextTransformer",
     # Data loading

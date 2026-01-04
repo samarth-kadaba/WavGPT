@@ -79,8 +79,14 @@ def train(
     save_path = Path(save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
 
-    # Setup mixed precision training
-    scaler = GradScaler() if use_amp and device == "cuda" else None
+    # Setup mixed precision training with conservative settings for stability
+    # Lower initial scale prevents overflow in early steps
+    scaler = GradScaler(
+        init_scale=2**10,  # Start lower than default 2**16
+        growth_factor=1.5,  # Slower growth
+        backoff_factor=0.5,
+        growth_interval=2000,  # Less frequent scale increases
+    ) if use_amp and device == "cuda" else None
     use_amp = use_amp and device == "cuda"
 
     # Optional: compile model for faster execution
@@ -174,13 +180,22 @@ def train(
                     
                     # Check for NaN gradients before clipping
                     has_nan_grad = False
-                    for param in model.parameters():
+                    nan_param_name = None
+                    for name, param in model.named_parameters():
                         if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
                             has_nan_grad = True
+                            nan_param_name = name
                             break
                     
                     if has_nan_grad:
-                        logger.warning("nan_gradient_detected", step=global_step)
+                        # Log which parameter and current scaler state for debugging
+                        scale_info = scaler.get_scale() if use_amp and scaler else "N/A"
+                        logger.warning(
+                            "nan_gradient_detected", 
+                            step=global_step, 
+                            parameter=nan_param_name,
+                            amp_scale=scale_info,
+                        )
                         optimizer.zero_grad()
                         if use_amp:
                             scaler.update()  # Still update scaler to adjust scale factor
@@ -253,7 +268,6 @@ def train(
                             # Get auxiliary losses
                             entropy_loss = outputs.get("entropy_loss")
                             sparsity_loss = outputs.get("sparsity_loss")
-                            distill_loss = outputs.get("distillation_loss")
                             
                             log_dict = {
                                 "loss": accumulated_loss,
@@ -265,7 +279,6 @@ def train(
                                 "boundary/mean_prob": mean_boundary_prob,
                                 "boundary/entropy_loss": entropy_loss.item() if entropy_loss is not None else 0.0,
                                 "boundary/sparsity_loss": sparsity_loss.item() if sparsity_loss is not None else 0.0,
-                                "boundary/distill_loss": distill_loss.item() if distill_loss is not None else 0.0,
                                 "total_tokens": total_tokens,
                                 "tokens_millions": total_tokens / 1e6,
                             }

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional
-
-import torch
+from dataclasses import dataclass
 
 
 @dataclass
@@ -30,7 +27,6 @@ class InfiniteContextConfig:
     dropout: float = 0.1
 
     boundary_temperature_init: float = 1.0
-    distillation_weight: float = 0.1
     entropy_weight: float = 0.1
     sparsity_weight: float = 0.5
 
@@ -39,22 +35,3 @@ class InfiniteContextConfig:
     def __post_init__(self):
         self.head_dim = self.hidden_size // self.n_heads
         assert self.hidden_size % self.n_heads == 0
-
-
-@dataclass
-class GenerationState:
-    """State for incremental generation."""
-
-    committed_chunk_embeds: List[torch.Tensor] = field(default_factory=list)
-    committed_chunk_contextualized: Optional[torch.Tensor] = None
-
-    chunk_conv_states: Optional[List[torch.Tensor]] = None
-    chunk_ssm_states: Optional[List[torch.Tensor]] = None
-    current_ssm_output: Optional[torch.Tensor] = None
-    current_chunk_size: int = 0
-
-    boundary_conv_states: Optional[List[torch.Tensor]] = None
-    boundary_ssm_states: Optional[List[torch.Tensor]] = None
-
-    n_boundaries: int = 0
-    position: int = 0

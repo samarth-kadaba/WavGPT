@@ -1,6 +1,6 @@
 """Model components for Infinite Context Transformer."""
 
-from wavgpt.models.config import InfiniteContextConfig, GenerationState
+from wavgpt.models.config import InfiniteContextConfig
 from wavgpt.models.s4 import SelectiveSSM, SSMLayer
 from wavgpt.models.attention import MultiHeadAttention
 from wavgpt.models.boundary import BoundaryDetector
@@ -10,7 +10,6 @@ from wavgpt.models.core import InfiniteContextTransformer, create_model
 
 __all__ = [
     "InfiniteContextConfig",
-    "GenerationState",
     "SelectiveSSM",
     "SSMLayer",
     "MultiHeadAttention",

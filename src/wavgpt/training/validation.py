@@ -68,8 +68,7 @@ def validate(
             else:
                 total_lm_loss += outputs["loss"].item()
 
-            if outputs.get("distillation_loss") is not None:
-                total_distill_loss += outputs["distillation_loss"].item()
+            # distillation_loss removed - AmortizedBoundaryPredictor no longer exists
 
             # Actual chunks
             n_chunks = outputs["n_chunks"]

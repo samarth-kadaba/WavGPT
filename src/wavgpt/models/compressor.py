@@ -90,11 +90,15 @@ class ChunkCompressor(nn.Module):
         chunk_ids_expanded = chunk_ids.unsqueeze(-1)
         chunk_indices_expanded = chunk_indices.view(1, 1, -1)
 
+        # Use log-space softmax for numerical stability instead of raw exp
+        # This prevents overflow/underflow with large distances
         dist = (chunk_ids_expanded - chunk_indices_expanded).abs()
-        soft_match = torch.exp(-dist * 10)
+        log_soft_match = -dist * 3.0  # Reduced from 10 to prevent sharp gradients
+        log_soft_match = log_soft_match.clamp(min=-20)  # Prevent underflow
+        soft_match = torch.softmax(log_soft_match, dim=-1)  # Stable softmax
 
         weights = soft_match * is_last_in_chunk.unsqueeze(-1)
-        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-8)
+        weights = weights / (weights.sum(dim=1, keepdim=True) + 1e-6)
 
         chunk_embeddings = torch.einsum("btd,btc->bcd", ssm_outputs, weights)
         chunk_embeddings = self.chunk_proj(chunk_embeddings)
