@@ -1,53 +1,68 @@
-"""Infinite Context Transformer with Learnable Chunking."""
+"""Context Extension via Learned Chunking with GRPO.
 
-__version__ = "2.0.0"
+This package extends pretrained transformer context windows by learning
+chunk boundaries via Group Relative Policy Optimization (GRPO).
+
+Key components:
+    - ContextExtender: Main model wrapping pretrained transformer
+    - BoundaryPolicy: Learns chunk boundaries via GRPO
+    - ChunkCompressor: Compresses token chunks into vectors
+    - GRPOTrainer: Training loop for GRPO-based learning
+"""
+
+__version__ = "4.0.0"
+
+import torch
+
+# Determine device
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 from wavgpt.models import (
     # Configuration
-    InfiniteContextConfig,
-    # Core components
+    ContextExtenderConfig,
+    TrainingConfig,
+    # SSM components
     SelectiveSSM,
     SSMLayer,
-    BoundaryDetector,
+    SSMBackbone,
+    # Policy
+    BoundaryPolicy,
+    BoundaryPolicyWithProjection,
+    # Compressor
     ChunkCompressor,
-    ChunkTransformer,
-    TokenPredictor,
+    ChunkInjector,
     # Main model
-    InfiniteContextTransformer,
-    # Utilities
-    create_model,
+    ContextExtender,
+    ContextExtenderOutput,
 )
 
-from wavgpt.config import DEVICE, VAL_RATIO, TEST_RATIO, VAL_INTERVAL
-
-from wavgpt.data import create_dataloader, create_dataloaders
-
-from wavgpt.training import train, validate, create_optimizer, create_scheduler
+from wavgpt.training import (
+    GRPOTrainer,
+    create_grpo_trainer,
+)
 
 __all__ = [
+    # Version
+    "__version__",
+    # Device
+    "DEVICE",
     # Configuration
-    "InfiniteContextConfig",
-    # Core components
+    "ContextExtenderConfig",
+    "TrainingConfig",
+    # SSM components
     "SelectiveSSM",
     "SSMLayer",
-    "BoundaryDetector",
+    "SSMBackbone",
+    # Policy
+    "BoundaryPolicy",
+    "BoundaryPolicyWithProjection",
+    # Compressor
     "ChunkCompressor",
-    "ChunkTransformer",
-    "TokenPredictor",
+    "ChunkInjector",
     # Main model
-    "InfiniteContextTransformer",
-    # Data loading
-    "create_dataloader",
-    "create_dataloaders",
+    "ContextExtender",
+    "ContextExtenderOutput",
     # Training
-    "train",
-    "validate",
-    "create_optimizer",
-    "create_scheduler",
-    # Config
-    "create_model",
-    "DEVICE",
-    "VAL_RATIO",
-    "TEST_RATIO",
-    "VAL_INTERVAL",
+    "GRPOTrainer",
+    "create_grpo_trainer",
 ]

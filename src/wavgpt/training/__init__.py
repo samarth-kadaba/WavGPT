@@ -1,21 +1,12 @@
-"""Training utilities for Infinite Context Transformer."""
+"""Training utilities for Context Extension.
 
-from wavgpt.training.training import train
-from wavgpt.training.validation import validate
-from wavgpt.training.utils import (
-    create_optimizer,
-    create_scheduler,
-    save_checkpoint,
-    load_checkpoint,
-)
-from wavgpt.training.step import train_step
+This package provides training infrastructure for learning context extension
+via GRPO (Group Relative Policy Optimization).
+"""
+
+from wavgpt.training.grpo import GRPOTrainer, create_grpo_trainer
 
 __all__ = [
-    "train",
-    "validate",
-    "create_optimizer",
-    "create_scheduler",
-    "save_checkpoint",
-    "load_checkpoint",
-    "train_step",
+    "GRPOTrainer",
+    "create_grpo_trainer",
 ]

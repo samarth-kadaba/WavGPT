@@ -1,152 +1,200 @@
-# WavGPT
+# Context Extension via GRPO
 
-Infinite Context Transformer with Learnable Chunking
+Extend pretrained transformer context windows through learned chunk boundaries using **Group Relative Policy Optimization (GRPO)**.
 
-## Overview
+## Key Insight
 
-WavGPT implements an efficient long-context transformer that learns to segment sequences into semantic chunks, enabling processing of 100K+ token contexts with O(T) + O(K²) complexity, where T is sequence length and K is the maximum number of chunks.
+Traditional approaches to context extension (RoPE scaling, sliding window, etc.) have limitations. This approach learns **where to place chunk boundaries** to optimally compress past context, using the language modeling loss as the reward signal.
 
-## Features
+## Architecture
 
-- **Learnable Boundary Detection**: O(T) learned value function for optimal chunk segmentation
-- **SSM-Based Compression**: State Space Models compress tokens within chunks
-- **Chunk Transformer**: O(K²) causal attention over chunk embeddings (the only quadratic operation)
-- **Efficient Generation**: Amortized boundary predictor for O(1) per-token decisions
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Pretrained Transformer (frozen)                            │
+│  - Processes: [compressed_chunks | current_window]         │
+└─────────────────────────────────────────────────────────────┘
+                              ↑
+              compressed chunks (K vectors)
+                              ↑
+┌─────────────────────────────────────────────────────────────┐
+│  ChunkCompressor (trainable)                                │
+│  - SSM compresses each chunk into a fixed-size vector      │
+└─────────────────────────────────────────────────────────────┘
+                              ↑
+           boundaries (discrete, from policy)
+                              ↑
+┌─────────────────────────────────────────────────────────────┐
+│  BoundaryPolicy (trained via GRPO)                          │
+│  - Learns where to place chunk boundaries                  │
+│  - Reward = negative language modeling loss                │
+└─────────────────────────────────────────────────────────────┘
+                              ↑
+                    past tokens
+```
+
+## GRPO Training
+
+**Group Relative Policy Optimization** is a baseline-free policy gradient method:
+
+1. Sample G boundary configurations from the policy
+2. For each: compress chunks → run transformer → compute LM loss
+3. Rewards = -LM_loss
+4. Advantages = (rewards - mean) / std (per-sequence normalization)
+5. Update policy: maximize E[advantages × log_prob]
+
+The key insight: by comparing multiple boundary placements on the **same sequence**, we can learn which placements lead to better predictions without needing a value network.
 
 ## Installation
 
-This project uses [uv](https://github.com/astral-sh/uv) for dependency management.
-
-### Prerequisites
-
-- Python 3.8 or higher
-- [uv](https://github.com/astral-sh/uv) installed
-
-### Setup
-
-1. Clone the repository:
 ```bash
-git clone https://github.com/samarth-kadaba/WavGPT.git
+# Clone repository
+git clone https://github.com/your-repo/WavGPT.git
 cd WavGPT
+
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install torch transformers datasets structlog wandb
+pip install mamba-ssm  # Optional: for faster SSM on GPU
+
+# Install package
+pip install -e .
 ```
 
-2. Install the package in editable mode with dependencies using uv:
-```bash
-uv sync
-```
-
-This will:
-- Create a virtual environment (`.venv/`)
-- Install all dependencies
-- Install the package in editable mode so changes are reflected immediately
-
-3. Activate the virtual environment (if not already activated by uv):
-```bash
-source .venv/bin/activate  # On Unix/macOS
-# or
-.venv\Scripts\activate  # On Windows
-```
-
-## Usage
+## Quick Start
 
 ### Training
 
-Train a model:
-
 ```bash
-python scripts/train.py
-```
+# Quick test with GPT-2
+python scripts/train.py --model gpt2 --debug
 
-With custom parameters:
-
-```bash
-python scripts/train.py --epochs 5 --batch-size 4 --max-length 16384
-python scripts/train.py --hidden-size 768 --n-heads 12 --max-chunks 512
+# Full training with larger model
+python scripts/train.py \
+    --model meta-llama/Llama-2-7b-hf \
+    --past-length 4096 \
+    --current-length 512 \
+    --max-chunks 64 \
+    --grpo-samples 4 \
+    --epochs 3
 ```
 
 ### Evaluation
 
-Evaluate a trained model:
+```bash
+# Evaluate checkpoint
+python scripts/evaluate.py --checkpoint checkpoints/best_model.pt
+
+# Quick test with generation
+python scripts/evaluate.py --model gpt2 --generate --prompt "The future of AI"
+```
+
+### Python API
+
+```python
+from wavgpt import ContextExtender, ContextExtenderConfig
+
+# Create model
+config = ContextExtenderConfig(
+    pretrained_model_name="gpt2",
+    max_chunks=64,
+    chunk_dim=256,
+)
+model = ContextExtender.from_pretrained("gpt2", config=config)
+
+# Forward pass with past context
+output = model(
+    input_ids=current_tokens,      # Current window
+    past_token_ids=past_tokens,    # Past context to compress
+    labels=current_tokens,
+)
+
+print(f"Loss: {output.loss}")
+print(f"Boundaries: {output.boundaries}")
+```
+
+## Configuration
+
+### Model Config (`ContextExtenderConfig`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `pretrained_model_name` | "gpt2" | HuggingFace model to extend |
+| `max_chunks` | 128 | Maximum compressed chunks |
+| `chunk_dim` | 256 | Dimension of compressed chunks |
+| `n_ssm_layers` | 4 | SSM backbone layers |
+| `grpo_num_samples` | 4 | Boundary configurations per batch |
+| `freeze_pretrained` | True | Keep pretrained model frozen |
+
+### Training Config (`TrainingConfig`)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `learning_rate` | 1e-4 | Learning rate for compressor |
+| `policy_lr` | 1e-5 | Learning rate for policy (RL) |
+| `batch_size` | 4 | Training batch size |
+| `grpo_num_samples` | 4 | GRPO samples per sequence |
+
+## Components
+
+### BoundaryPolicy
+- SSM backbone processes input sequence
+- Policy head outputs boundary probability at each position
+- Trained via GRPO (policy gradient with group-relative advantages)
+
+### ChunkCompressor  
+- SSM accumulates information within each chunk
+- Outputs fixed-size vector per chunk
+- Trained with standard gradients (differentiable)
+
+### ChunkInjector
+- Projects compressed chunks to transformer dimension
+- Adds positional embeddings
+- Creates "virtual tokens" prepended to input
+
+## Mathematical Foundation
+
+### GRPO Objective
+
+For sequence x with G sampled boundary configurations:
+
+```
+L_policy = -E_{B~π}[A(B) · log π(B|x)]
+
+where:
+  A(B) = (r(B) - μ_r) / σ_r  (group-relative advantage)
+  r(B) = -LM_loss(B)          (reward)
+```
+
+### Why GRPO over Gumbel-Softmax?
+
+1. **No train/test gap**: Both use discrete boundaries
+2. **Better credit assignment**: Compares outcomes directly
+3. **Baseline-free**: No value network needed
+4. **Explores discrete space**: Samples actual configurations
+
+## Tests
 
 ```bash
-python scripts/evaluate.py --checkpoint path/to/checkpoint.pt
-python scripts/evaluate.py --generate --prompt "Your prompt here"
-```
+# Run all tests
+python -m pytest tests/ -v
 
-### Configuration
-
-Edit `src/wavgpt/config.py` to modify default hyperparameters:
-
-- `HIDDEN_SIZE`: Model hidden dimension (default: 768)
-- `N_HEADS`: Number of attention heads (default: 12)
-- `MAX_CHUNKS`: Maximum number of chunks K (default: 256)
-- `BATCH_SIZE`: Training batch size (default: 2)
-- `MAX_LENGTH`: Maximum sequence length (default: 8192)
-- `LEARNING_RATE`: Learning rate (default: 1e-4)
-- `NUM_EPOCHS`: Number of training epochs (default: 3)
-
-## Project Structure
-
-```
-WavGPT/
-├── src/
-│   └── wavgpt/
-│       ├── __init__.py
-│       ├── config.py           # Configuration constants
-│       ├── models/              # Model components
-│       │   ├── core.py          # Main transformer model
-│       │   ├── boundary.py      # Boundary detection
-│       │   ├── compressor.py    # Chunk compression
-│       │   ├── transformer.py   # Chunk transformer
-│       │   └── s4.py            # SSM layers
-│       ├── data/                # Data loading
-│       └── training/            # Training utilities
-├── scripts/
-│   ├── train.py                # Training script
-│   └── evaluate.py             # Evaluation script
-├── tests/                       # Test files
-├── pyproject.toml              # Project configuration
-└── README.md                   # This file
-```
-
-## Model Architecture
-
-The model consists of four main components:
-
-1. **BoundaryDetector**: Learns to detect semantic chunk boundaries using O(T) learned value function
-2. **ChunkCompressor**: Compresses tokens within chunks using SSM layers
-3. **ChunkTransformer**: Applies causal attention over chunk embeddings (O(K²))
-4. **TokenPredictor**: Combines global (chunk) and local (SSM) context for token prediction
-
-### Complexity
-
-- Boundary detection: O(T) via learned value function
-- Chunk compression: O(T) via SSM processing
-- Chunk transformer: O(K²) causal attention
-- **Total**: O(T) + O(K²) where K ≤ max_chunks
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@software{wavgpt,
-  title={WavGPT: Infinite Context Transformer with Learnable Chunking},
-  author={Your Name},
-  year={2024},
-  url={https://github.com/samarth-kadaba/WavGPT}
-}
+# Run specific test class
+python -m pytest tests/test_context_extension.py::TestBoundaryPolicy -v
 ```
 
 ## License
 
-MIT License
+MIT
 
-## Contributing
+## Citation
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Acknowledgments
-
-- HuggingFace Transformers library
-- PyTorch team
+```bibtex
+@software{context_extension_grpo,
+  title = {Context Extension via GRPO},
+  year = {2026},
+  url = {https://github.com/your-repo/WavGPT}
+}
+```
