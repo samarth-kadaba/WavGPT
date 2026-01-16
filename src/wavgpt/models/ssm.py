@@ -470,6 +470,11 @@ class SSMBackbone(nn.Module):
         """
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
+                # Ensure input requires grad for proper checkpointing
+                # This is needed when input comes from frozen pretrained model
+                # but we still want gradients through this module's parameters
+                if not x.requires_grad:
+                    x = x.detach().requires_grad_(True)
                 x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
             else:
                 x = layer(x)

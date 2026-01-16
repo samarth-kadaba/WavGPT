@@ -1,23 +1,20 @@
-"""GRPO Training for Context Extension.
+"""GRPO Training for Context Extension with Unified Policy-Compressor.
 
 Group Relative Policy Optimization (GRPO) training loop for learning
-chunk boundaries. GRPO is a baseline-free policy gradient method that
-uses the group mean as the baseline.
+chunk boundaries with credit assignment via difficulty scores.
 
-Key insight: By sampling multiple boundary configurations and comparing
-their rewards (negative LM loss), we can learn which boundary placements
-lead to better language modeling without needing a value network.
+KEY INSIGHT: The unified policy-compressor shares an SSM backbone,
+enabling end-to-end credit assignment. Difficulty scores tell the
+policy which boundary placements make compression hard vs easy.
 
 Algorithm:
     For each batch:
         1. Sample G boundary configurations from policy
-        2. For each: compress chunks, forward through transformer, get LM loss
+        2. For each: compress chunks (reusing hidden states!), forward through transformer
         3. Rewards = -LM_loss
-        4. Advantages = (rewards - mean) / std (per-sequence normalization)
-        5. Policy loss = -mean(advantages * log_probs)
-        6. Compressor loss = mean(LM_loss) over all samples
-        7. Update policy with policy gradient
-        8. Update compressor with standard gradients
+        4. Advantages = (rewards - mean) / std
+        5. Policy loss = GRPO with difficulty-based credit assignment
+        6. Update with gradient descent
 """
 
 from __future__ import annotations
@@ -47,11 +44,12 @@ logger = structlog.get_logger()
 
 class GRPOTrainer:
     """
-    GRPO Trainer for context extension.
+    GRPO Trainer for unified policy-compressor architecture.
     
-    Handles the two-phase training:
-        1. Policy: GRPO (policy gradient with group-relative advantages)
-        2. Compressor: Standard gradient descent on LM loss
+    Handles training with:
+        - GRPO policy gradient with difficulty-based credit assignment
+        - Shared SSM backbone between policy and compression
+        - Reference policy for importance sampling
     """
     
     def __init__(
@@ -72,51 +70,67 @@ class GRPOTrainer:
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         
-        # Move model to device
         self.model.to(self.device)
         
-        # Create optimizer if not provided
         if optimizer is None:
             self.optimizer = self._create_optimizer()
         else:
             self.optimizer = optimizer
         
-        # Create warmup scheduler if not provided
         if scheduler is None:
-            # Warmup for first 100 steps, then constant
             self.scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer,
-                lr_lambda=lambda step: min(1.0, (step + 1) / 100)  # Linear warmup
+                lr_lambda=lambda step: min(1.0, (step + 1) / 100)
             )
         else:
             self.scheduler = scheduler
         
-        # Mixed precision
         self.scaler = GradScaler() if train_config.use_amp else None
         self.use_amp = train_config.use_amp and self.device == "cuda"
         
-        # Reference policy for importance sampling ratio (required for PPO-style clipping)
-        # This is a frozen copy used to compute π_old in the ratio r = π_new / π_old
-        # Use the full policy wrapper (with projection) since embeddings are in pretrained dim
+        # Reference policy (frozen copy for importance sampling)
         self.ref_policy = copy.deepcopy(model.policy)
         for param in self.ref_policy.parameters():
             param.requires_grad = False
         self.ref_policy.eval()
         
-        # Tracking
         self.global_step = 0
         self.best_loss = float("inf")
+        
+        if hasattr(self.model, 'compile_modules'):
+            self.model.compile_modules()
     
     def _update_ref_policy(self):
-        """Update reference policy to current policy (for importance sampling)."""
-        self.ref_policy.load_state_dict(self.model.policy.state_dict())
+        """Update reference policy to current policy."""
+        current_state = self.model.policy.state_dict()
+        
+        # Handle torch.compile prefix
+        cleaned_state = {}
+        for key, value in current_state.items():
+            clean_key = key.replace('._orig_mod.', '.').replace('_orig_mod.', '')
+            cleaned_state[clean_key] = value
+        
+        ref_keys = set(self.ref_policy.state_dict().keys())
+        current_cleaned_keys = set(cleaned_state.keys())
+        
+        if ref_keys == current_cleaned_keys:
+            self.ref_policy.load_state_dict(cleaned_state)
+        else:
+            try:
+                self.ref_policy.load_state_dict(cleaned_state, strict=False)
+            except RuntimeError as e:
+                logger.warning("ref_policy_update_failed", error=str(e)[:200])
+                self.ref_policy = copy.deepcopy(self.model.policy)
+                if hasattr(self.ref_policy, '_orig_mod'):
+                    self.ref_policy = self.ref_policy._orig_mod
+                for param in self.ref_policy.parameters():
+                    param.requires_grad = False
+        
         self.ref_policy.eval()
     
     def _create_optimizer(self) -> torch.optim.Optimizer:
-        """Create optimizer with separate learning rates for policy and compressor."""
-        # Group parameters
+        """Create optimizer with separate LRs for policy and injector."""
         policy_params = list(self.model.policy.parameters())
-        compressor_params = list(self.model.compressor.parameters())
         injector_params = list(self.model.injector.parameters())
         
         param_groups = [
@@ -126,13 +140,12 @@ class GRPOTrainer:
                 "name": "policy",
             },
             {
-                "params": compressor_params + injector_params,
+                "params": injector_params,
                 "lr": self.train_config.learning_rate,
-                "name": "compressor",
+                "name": "injector",
             },
         ]
         
-        # Add pretrained params if not frozen
         if not self.model_config.freeze_pretrained:
             pretrained_params = [
                 p for p in self.model.pretrained.parameters()
@@ -141,7 +154,7 @@ class GRPOTrainer:
             if pretrained_params:
                 param_groups.append({
                     "params": pretrained_params,
-                    "lr": self.train_config.learning_rate * 0.1,  # Lower LR
+                    "lr": self.train_config.learning_rate * 0.1,
                     "name": "pretrained",
                 })
         
@@ -158,26 +171,14 @@ class GRPOTrainer:
         labels: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
-        """
-        Single training step with GRPO.
-        
-        Args:
-            input_ids: (B, T) full sequence tokens (model decides chunking)
-            labels: (B, T) labels for LM loss
-            attention_mask: (B, T) attention mask
-            
-        Returns:
-            metrics: Dictionary of training metrics
-        """
+        """Single training step with GRPO."""
         self.model.train()
         
-        # Move to device
         input_ids = input_ids.to(self.device)
         labels = labels.to(self.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         
-        # Forward with GRPO sampling (model internally handles chunking)
         with autocast(device_type="cuda", enabled=self.use_amp):
             grpo_batch = self.model.forward_grpo(
                 input_ids=input_ids,
@@ -187,30 +188,27 @@ class GRPOTrainer:
                 temperature=self.model_config.grpo_temperature,
             )
             
-            # Compute reference policy output for importance ratio
-            # CRITICAL: Use ref policy's OWN logits for stable ratio computation
+            # Reference policy output for importance ratio
             with torch.no_grad():
                 ref_policy_output = self.ref_policy.forward(
-                    grpo_batch.embeddings,
+                    grpo_batch.hidden_states,
                     attention_mask=attention_mask,
                 )
             
-            # Compute policy loss (GRPO)
+            # GRPO loss with difficulty-based credit assignment
             policy_loss, policy_metrics = self.model.compute_grpo_loss(
                 grpo_batch, ref_policy_output
             )
             
-            # Compute compressor loss
+            # Compressor loss (from first sample)
             compressor_loss = self.model.compute_compressor_loss(grpo_batch)
             
-            # Get KL penalty (prevents drift from original model)
-            kl_penalty = grpo_batch.kl_penalty if grpo_batch.kl_penalty is not None else torch.tensor(0.0, device=self.device)
-            kl_weight = self.model_config.kl_penalty_weight if hasattr(self.model_config, 'kl_penalty_weight') else 0.0
+            # Scale policy loss
+            policy_loss_scale = getattr(self.model_config, 'policy_loss_scale', 1000.0)
+            scaled_policy_loss = policy_loss * policy_loss_scale
             
-            # Total loss (policy + compressor + KL penalty)
-            total_loss = policy_loss + compressor_loss + kl_weight * kl_penalty
+            total_loss = scaled_policy_loss + compressor_loss
         
-        # Backward pass
         self.optimizer.zero_grad()
         
         if self.use_amp:
@@ -233,17 +231,14 @@ class GRPOTrainer:
         if self.scheduler is not None:
             self.scheduler.step()
         
-        # Compile metrics
         metrics = {
             "total_loss": total_loss.item(),
             "compressor_loss": compressor_loss.item(),
-            "kl_penalty": kl_penalty.item() if torch.is_tensor(kl_penalty) else kl_penalty,
             **policy_metrics,
             "lr/policy": self.optimizer.param_groups[0]["lr"],
-            "lr/compressor": self.optimizer.param_groups[1]["lr"],
+            "lr/injector": self.optimizer.param_groups[1]["lr"],
         }
         
-        # Add pretrained LR if training full model
         if len(self.optimizer.param_groups) > 2:
             metrics["lr/pretrained"] = self.optimizer.param_groups[2]["lr"]
         
@@ -255,14 +250,7 @@ class GRPOTrainer:
         val_loader: Optional[DataLoader] = None,
         num_epochs: int = 1,
     ):
-        """
-        Full training loop.
-        
-        Args:
-            train_loader: Training data loader
-            val_loader: Optional validation loader
-            num_epochs: Number of epochs (or use max_steps)
-        """
+        """Full training loop."""
         logger.info(
             "training_start",
             device=self.device,
@@ -276,12 +264,10 @@ class GRPOTrainer:
             
             epoch_metrics = self._train_epoch(train_loader, epoch)
             
-            # Validation
             if val_loader is not None:
                 val_metrics = self.validate(val_loader)
                 epoch_metrics.update(val_metrics)
                 
-                # Save best model
                 if val_metrics.get("val_loss", float("inf")) < self.best_loss:
                     self.best_loss = val_metrics["val_loss"]
                     self.save_checkpoint("best_model.pt")
@@ -289,14 +275,9 @@ class GRPOTrainer:
             
             logger.info("epoch_complete", epoch=epoch + 1, **epoch_metrics)
             
-            # Update reference policy at end of epoch (standard PPO practice)
-            # This ensures the importance ratio stays close to 1
             self._update_ref_policy()
-            
-            # Save epoch checkpoint
             self.save_checkpoint(f"epoch_{epoch + 1}.pt")
             
-            # Check max steps
             if (
                 self.train_config.max_steps is not None and
                 self.global_step >= self.train_config.max_steps
@@ -321,7 +302,6 @@ class GRPOTrainer:
         
         for batch_idx, batch in enumerate(pbar):
             try:
-                # Extract batch components
                 if isinstance(batch, dict):
                     input_ids = batch["input_ids"]
                     labels = batch.get("labels", batch["input_ids"])
@@ -331,7 +311,6 @@ class GRPOTrainer:
                     labels = batch[1] if len(batch) > 1 else batch[0]
                     attention_mask = batch[2] if len(batch) > 2 else None
                 
-                # Training step with gradient accumulation
                 is_accumulating = (batch_idx + 1) % grad_accum_steps != 0
                 metrics = self.train_step_with_accumulation(
                     input_ids=input_ids,
@@ -341,26 +320,23 @@ class GRPOTrainer:
                     grad_accum_steps=grad_accum_steps,
                 )
                 
-                # Only count as step when we actually update
                 if not is_accumulating:
                     self.global_step += 1
                 
                 if metrics is not None:
-                    epoch_losses.append(metrics["total_loss"])
+                    epoch_losses.append(metrics["lm_loss"])
                     
-                    # Accumulate metrics
                     for k, v in metrics.items():
                         if k not in accumulated_metrics:
                             accumulated_metrics[k] = []
                         accumulated_metrics[k].append(v)
                     
-                    # Update progress bar
                     pbar.set_postfix({
-                        "loss": f"{metrics['total_loss']:.4f}",
-                        "reward": f"{metrics.get('policy/mean_reward', 0):.4f}",
+                        "lm_loss": f"{metrics['lm_loss']:.4f}",
+                        "chunks": f"{metrics.get('policy/mean_chunks', 0):.1f}",
+                        "difficulty": f"{metrics.get('policy/difficulty_loss', 0):.4f}",
                     })
                 
-                # Logging
                 if self.global_step > 0 and self.global_step % self.train_config.log_interval == 0 and accumulated_metrics:
                     avg_metrics = {
                         k: sum(v) / len(v) for k, v in accumulated_metrics.items()
@@ -372,11 +348,9 @@ class GRPOTrainer:
                     
                     accumulated_metrics = {}
                 
-                # Save checkpoint
                 if self.global_step > 0 and self.global_step % self.train_config.save_interval == 0:
                     self.save_checkpoint(f"checkpoint_{self.global_step}.pt")
                 
-                # Max steps check
                 if (
                     self.train_config.max_steps is not None and
                     self.global_step >= self.train_config.max_steps
@@ -388,12 +362,12 @@ class GRPOTrainer:
                     logger.warning("oom_error", batch=batch_idx, seq_len=input_ids.shape[1] if hasattr(input_ids, 'shape') else 'unknown')
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
-                    # Skip this batch entirely
                     self.optimizer.zero_grad()
                     continue
                 raise
         
-        return {"train_loss": sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0}
+        avg_lm_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else float('inf')
+        return {"train_lm_loss": avg_lm_loss}
     
     def train_step_with_accumulation(
         self,
@@ -403,28 +377,14 @@ class GRPOTrainer:
         is_accumulating: bool = False,
         grad_accum_steps: int = 1,
     ) -> Optional[Dict[str, float]]:
-        """
-        Training step with gradient accumulation support.
-        
-        Args:
-            input_ids: (B, T) token IDs
-            labels: (B, T) labels
-            attention_mask: (B, T) attention mask
-            is_accumulating: If True, don't step optimizer yet
-            grad_accum_steps: Number of accumulation steps (for loss scaling)
-            
-        Returns:
-            metrics: Dict of metrics (only on optimizer step), else None
-        """
+        """Training step with gradient accumulation."""
         self.model.train()
         
-        # Move to device
         input_ids = input_ids.to(self.device)
         labels = labels.to(self.device)
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
         
-        # Forward with GRPO sampling
         with autocast(device_type="cuda", enabled=self.use_amp):
             grpo_batch = self.model.forward_grpo(
                 input_ids=input_ids,
@@ -434,10 +394,9 @@ class GRPOTrainer:
                 temperature=self.model_config.grpo_temperature,
             )
             
-            # Compute reference policy output for importance ratio
             with torch.no_grad():
                 ref_policy_output = self.ref_policy.forward(
-                    grpo_batch.embeddings,
+                    grpo_batch.hidden_states,
                     attention_mask=attention_mask,
                 )
             
@@ -446,19 +405,16 @@ class GRPOTrainer:
             )
             compressor_loss = self.model.compute_compressor_loss(grpo_batch)
             
-            kl_penalty = grpo_batch.kl_penalty if grpo_batch.kl_penalty is not None else torch.tensor(0.0, device=self.device)
-            kl_weight = getattr(self.model_config, 'kl_penalty_weight', 0.0)
+            policy_loss_scale = getattr(self.model_config, 'policy_loss_scale', 1000.0)
+            scaled_policy_loss = policy_loss * policy_loss_scale
             
-            # Scale loss by accumulation steps
-            total_loss = (policy_loss + compressor_loss + kl_weight * kl_penalty) / grad_accum_steps
+            total_loss = (scaled_policy_loss + compressor_loss) / grad_accum_steps
         
-        # Backward (accumulates gradients)
         if self.use_amp:
             self.scaler.scale(total_loss).backward()
         else:
             total_loss.backward()
         
-        # Only step optimizer when not accumulating
         if not is_accumulating:
             if self.use_amp:
                 self.scaler.unscale_(self.optimizer)
@@ -475,22 +431,24 @@ class GRPOTrainer:
                 )
                 self.optimizer.step()
             
-            self.optimizer.zero_grad()
-            
             if self.scheduler is not None:
                 self.scheduler.step()
             
-            # Return metrics only when we step
+            self.optimizer.zero_grad()
+            
+            mean_reward = grpo_batch.rewards.mean().item()
+            lm_loss = -mean_reward
+            
             return {
-                "total_loss": total_loss.item() * grad_accum_steps,  # Unscale for logging
+                "total_loss": total_loss.item() * grad_accum_steps,
+                "lm_loss": lm_loss,
                 "compressor_loss": compressor_loss.item(),
-                "kl_penalty": kl_penalty.item() if torch.is_tensor(kl_penalty) else kl_penalty,
                 **policy_metrics,
                 "lr/policy": self.optimizer.param_groups[0]["lr"],
-                "lr/compressor": self.optimizer.param_groups[1]["lr"],
+                "lr/injector": self.optimizer.param_groups[1]["lr"],
             }
         
-        return None  # Still accumulating
+        return None
     
     @torch.no_grad()
     def validate(
@@ -512,21 +470,17 @@ class GRPOTrainer:
             try:
                 if isinstance(batch, dict):
                     input_ids = batch["input_ids"].to(self.device)
-                    past_token_ids = batch.get("past_token_ids", batch["input_ids"]).to(self.device)
                     labels = batch.get("labels", batch["input_ids"]).to(self.device)
                     attention_mask = batch.get("attention_mask")
                     if attention_mask is not None:
                         attention_mask = attention_mask.to(self.device)
                 else:
                     input_ids = batch[0].to(self.device)
-                    past_token_ids = batch[1].to(self.device) if len(batch) > 1 else input_ids
-                    labels = batch[2].to(self.device) if len(batch) > 2 else input_ids
-                    attention_mask = batch[3].to(self.device) if len(batch) > 3 else None
+                    labels = batch[1].to(self.device) if len(batch) > 1 else input_ids
+                    attention_mask = batch[2].to(self.device) if len(batch) > 2 else None
                 
-                # Forward with deterministic boundaries
                 output = self.model(
                     input_ids=input_ids,
-                    past_token_ids=past_token_ids,
                     labels=labels,
                     attention_mask=attention_mask,
                     use_deterministic_boundaries=True,
@@ -612,4 +566,3 @@ def create_grpo_trainer(
         model_config=model_config,
         **kwargs,
     )
-

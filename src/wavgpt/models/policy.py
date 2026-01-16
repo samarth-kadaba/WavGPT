@@ -1,24 +1,34 @@
-"""Chunking Policy for GRPO-based boundary and retention learning.
+"""Unified Policy-Compressor Network with Importance-Threshold Selection.
 
-This module implements the policy network that learns:
-    1. WHERE to place chunk boundaries
-    2. WHICH tokens to keep at full fidelity (for retrieval)
+This module implements a policy that learns:
+    1. IMPORTANCE scores for each position (how valuable is a boundary here?)
+    2. THRESHOLD for boundary selection (what's "important enough"?)
+    3. HOW to compress chunks (compression head)
 
-The policy outputs TWO decisions per token:
-    - boundary_prob: probability of ending a chunk at this position
-    - keep_prob: probability of keeping this token verbatim (not compressed)
+The key insight: boundaries COMPETE for limited slots. Instead of independent
+probabilities, we learn a ranking. Positions above the threshold become boundaries,
+with a hard cap at max_context.
 
-GRPO Algorithm:
-    1. Sample G (boundary, keep) configurations from policy
-    2. Compute reward (negative LM loss) for each
-    3. Compute group-relative advantage: A_i = (r_i - mean) / std
-    4. Update policy to maximize advantage-weighted log probability
-
-Constraint: num_chunks + num_kept_tokens <= max_context
+Architecture:
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Shared SSM Backbone + Position Encoding                        │
+    └─────────────────────────────────────────────────────────────────┘
+                              ↓
+         ┌────────────────────┼────────────────────┐
+         ↓                    ↓                    ↓
+    ┌───────────┐       ┌───────────┐        ┌─────────────┐
+    │ Importance│       │ Threshold │        │ Compression │
+    │   Head    │       │   Head    │        │    Head     │
+    └───────────┘       └───────────┘        └─────────────┘
+         ↓                    ↓                    ↓
+    importance[t]        threshold           chunk_embeds
+    
+    boundary[t] = importance[t] > threshold (with top-K cap)
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, NamedTuple
 
@@ -30,55 +40,78 @@ from wavgpt.models.config import ContextExtenderConfig
 
 
 class PolicySample(NamedTuple):
-    """A sampled configuration with boundaries and kept tokens."""
-    boundaries: torch.Tensor      # (B, T) binary: 1 = end chunk here
-    keep_mask: torch.Tensor       # (B, T) binary: 1 = keep this token verbatim
-    log_probs: torch.Tensor       # (B,) log probability of this configuration
-    boundary_logits: torch.Tensor # (B, T) boundary logits (for stable log-prob)
-    keep_logits: torch.Tensor     # (B, T) keep logits (for stable log-prob)
-    boundary_probs: torch.Tensor  # (B, T) boundary probability at each position
-    keep_probs: torch.Tensor      # (B, T) keep probability at each position
-
-
-# Alias for backwards compatibility
-BoundarySample = PolicySample
+    """A sampled boundary configuration."""
+    boundaries: torch.Tensor      # (B, T) binary: 1 = boundary here
+    keep_mask: torch.Tensor       # (B, T) binary: 1 = keep this token
+    log_probs: torch.Tensor       # (B,) log probability of this sample
+    boundary_probs: torch.Tensor  # (B, T) boundary probabilities
+    keep_probs: torch.Tensor      # (B, T) keep probabilities
 
 
 @dataclass
 class PolicyOutput:
     """Output from policy forward pass."""
-    boundary_logits: torch.Tensor   # (B, T) raw boundary logits
-    boundary_probs: torch.Tensor    # (B, T) boundary probabilities
-    keep_logits: torch.Tensor       # (B, T) raw keep logits
-    keep_probs: torch.Tensor        # (B, T) keep probabilities
-    hidden_states: torch.Tensor     # (B, T, D) SSM hidden states
+    boundary_importance: torch.Tensor  # (B, T) importance scores
+    boundary_threshold: torch.Tensor   # (B,) per-sequence threshold
+    boundary_probs: torch.Tensor       # (B, T) soft selection probabilities
+    keep_importance: torch.Tensor      # (B, T) keep importance scores
+    keep_threshold: torch.Tensor       # (B,) per-sequence keep threshold
+    keep_probs: torch.Tensor           # (B, T) soft keep probabilities
+    hidden_states: torch.Tensor        # (B, T, D) for compression
+    difficulty_scores: torch.Tensor    # (B, T) compression difficulty
 
 
-class BoundaryPolicy(nn.Module):
+class SinusoidalPositionEncoding(nn.Module):
+    """Sinusoidal position encoding with normalized positions [0, 1]."""
+    
+    def __init__(self, dim: int):
+        super().__init__()
+        self.dim = dim
+        
+        # Precompute frequency bands
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq)
+    
+    def forward(self, positions: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            positions: (T,) or (B, T) normalized positions in [0, 1]
+        Returns:
+            (T, D) or (B, T, D) position embeddings
+        """
+        # Scale to reasonable range for sinusoids
+        positions = positions * 1000  # Scale up for frequency variation
+        
+        if positions.dim() == 1:
+            # (T,) -> (T, D//2)
+            sinusoid_inp = positions.unsqueeze(-1) * self.inv_freq.unsqueeze(0)
+        else:
+            # (B, T) -> (B, T, D//2)
+            sinusoid_inp = positions.unsqueeze(-1) * self.inv_freq.unsqueeze(0).unsqueeze(0)
+        
+        # Interleave sin and cos
+        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
+        return pos_emb
+
+
+class PolicyCompressor(nn.Module):
     """
-    Policy network for learning chunk boundaries AND token retention via GRPO.
+    Policy network using importance-threshold selection.
     
-    Architecture:
-        1. SSM backbone processes input embeddings → hidden states
-        2. Boundary head: hidden states → boundary logits (where to chunk)
-        3. Keep head: hidden states → keep logits (what to keep verbatim)
-        4. During training: sample from Bernoulli for both decisions
-        5. During inference: threshold at 0.5
-    
-    The policy outputs TWO independent decisions per token:
-        π(B, K|x) = ∏_t π(b_t | h_t) * π(k_t | h_t)
-    
-    Constraint enforced during sampling: num_chunks + num_kept <= max_context
+    Key features:
+    1. Position-aware: knows where each token is in the sequence
+    2. Budget-aware: learns threshold to control boundary count
+    3. At most K: hard cap ensures never exceeds budget
+    4. Adaptive: threshold varies per sequence based on content
     """
     
     def __init__(self, config: ContextExtenderConfig):
         super().__init__()
         self.config = config
         
-        # Import here to avoid circular dependency
         from wavgpt.models.ssm import SSMBackbone
         
-        # SSM backbone for processing context
+        # Shared SSM backbone
         self.backbone = SSMBackbone(
             d_model=config.chunk_dim,
             n_layers=config.n_ssm_layers,
@@ -89,32 +122,75 @@ class BoundaryPolicy(nn.Module):
             gradient_checkpointing=config.gradient_checkpointing,
         )
         
-        # Boundary head: hidden state → boundary logit (where to chunk)
-        self.boundary_head = nn.Sequential(
+        # Position encoding
+        self.pos_encoder = SinusoidalPositionEncoding(config.chunk_dim)
+        self.pos_proj = nn.Linear(config.chunk_dim, config.chunk_dim)
+        
+        # Importance head: how important is a boundary at each position?
+        self.importance_head = nn.Sequential(
             nn.Linear(config.chunk_dim, config.policy_hidden_dim),
             nn.GELU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.policy_hidden_dim, 1),
         )
         
-        # Keep head: hidden state → keep logit (what to retain verbatim)
-        self.keep_head = nn.Sequential(
+        # Threshold head: what's the bar for "important enough"?
+        # Takes global representation -> per-sequence threshold
+        self.threshold_head = nn.Sequential(
+            nn.Linear(config.chunk_dim, config.policy_hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.policy_hidden_dim, 1),
+        )
+        
+        # Keep token heads (same structure)
+        self.keep_importance_head = nn.Sequential(
             nn.Linear(config.chunk_dim, config.policy_hidden_dim),
             nn.GELU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.policy_hidden_dim, 1),
         )
+        self.keep_threshold_head = nn.Sequential(
+            nn.Linear(config.chunk_dim, config.policy_hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.policy_hidden_dim, 1),
+        )
         
-        # Initialize biases
+        # Compression head
+        self.compression_head = nn.Sequential(
+            nn.Linear(config.chunk_dim, config.chunk_dim),
+            nn.LayerNorm(config.chunk_dim),
+        )
+        
+        # Difficulty prediction for credit assignment
+        self.difficulty_head = nn.Sequential(
+            nn.Linear(config.chunk_dim, config.policy_hidden_dim),
+            nn.GELU(),
+            nn.Linear(config.policy_hidden_dim, 1),
+        )
+        
+        # Temperature for soft selection (learnable)
+        self.log_temperature = nn.Parameter(torch.tensor(0.0))
+        
+        # Lagrangian price for budget constraint (learnable)
+        # λ = exp(log_λ) ensures λ > 0
+        # Cost = λ * expected_boundaries penalizes using budget
+        # λ self-adjusts: increases when over budget, decreases when under
+        self.log_lambda = nn.Parameter(torch.tensor(0.0))  # Start at λ=1
+        
+        # Initialize thresholds to reasonable values
+        self._init_thresholds()
+    
+    def _init_thresholds(self):
+        """Initialize threshold heads to produce reasonable initial thresholds."""
+        # Start with threshold ≈ 0, so about half of positions are above
         with torch.no_grad():
-            # Start at 50% for better exploration (was -2.0 → 12%)
-            self.boundary_head[-1].bias.fill_(config.initial_boundary_bias)
-            # Start conservative for keep decisions
-            initial_keep = getattr(config, 'initial_keep_bias', -2.0)
-            self.keep_head[-1].bias.fill_(initial_keep)
-        
-        # Learnable temperature for sampling (optional)
-        self.log_temperature = nn.Parameter(torch.zeros(1))
+            self.threshold_head[-1].bias.fill_(0.0)
+            self.keep_threshold_head[-1].bias.fill_(1.0)  # Keep tokens more conservatively
+    
+    @property
+    def temperature(self) -> torch.Tensor:
+        """Clamped temperature for numerical stability."""
+        return self.log_temperature.exp().clamp(0.1, 10.0)
     
     def forward(
         self,
@@ -122,49 +198,66 @@ class BoundaryPolicy(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ) -> PolicyOutput:
         """
-        Compute boundary and keep probabilities for a sequence.
+        Forward pass: compute importance scores and thresholds.
         
         Args:
-            x: (B, T, D) input embeddings (projected to chunk_dim)
-            attention_mask: (B, T) optional mask for valid tokens (1=valid, 0=padding)
+            x: (B, T, D) input embeddings
+            attention_mask: (B, T) optional mask for valid tokens
             
         Returns:
-            PolicyOutput with boundary/keep logits, probs, and hidden states
+            PolicyOutput with importance, threshold, and probs
         """
+        B, T, D = x.shape
+        device = x.device
+        
         # Process through backbone
         hidden = self.backbone(x)  # (B, T, D)
         
-        # Compute boundary logits
-        boundary_logits = self.boundary_head(hidden).squeeze(-1)  # (B, T)
+        # Add position encoding (normalized positions [0, 1])
+        positions = torch.arange(T, device=device, dtype=x.dtype) / max(T - 1, 1)
+        pos_emb = self.pos_encoder(positions)  # (T, D)
+        pos_emb = self.pos_proj(pos_emb)  # (T, D)
         
-        # First position is never a boundary - use safe mask value
-        # -20 gives sigmoid(-20) ≈ 2e-9, effectively 0 but numerically safe
-        SAFE_MASK_VALUE = -20.0
-        boundary_logits = torch.cat([
-            torch.full((boundary_logits.size(0), 1), SAFE_MASK_VALUE, 
-                       device=boundary_logits.device, dtype=boundary_logits.dtype),
-            boundary_logits[:, 1:]
-        ], dim=1)
+        hidden_with_pos = hidden + pos_emb.unsqueeze(0)  # (B, T, D)
         
-        # Compute keep logits (which tokens to retain verbatim)
-        keep_logits = self.keep_head(hidden).squeeze(-1)  # (B, T)
+        # Compute importance scores
+        boundary_importance = self.importance_head(hidden_with_pos).squeeze(-1)  # (B, T)
+        keep_importance = self.keep_importance_head(hidden_with_pos).squeeze(-1)  # (B, T)
         
-        # Mask out padded positions with safe value
+        # Compute per-sequence thresholds from global representation
+        global_repr = hidden.mean(dim=1)  # (B, D)
+        boundary_threshold = self.threshold_head(global_repr).squeeze(-1)  # (B,)
+        keep_threshold = self.keep_threshold_head(global_repr).squeeze(-1)  # (B,)
+        
+        # Soft boundary probabilities: sigmoid((importance - threshold) / temperature)
+        temp = self.temperature
+        boundary_diff = boundary_importance - boundary_threshold.unsqueeze(1)  # (B, T)
+        boundary_probs = torch.sigmoid(boundary_diff / temp)
+        
+        keep_diff = keep_importance - keep_threshold.unsqueeze(1)
+        keep_probs = torch.sigmoid(keep_diff / temp)
+        
+        # Mask first position (never a boundary) and padded positions
+        boundary_probs = boundary_probs.clone()
+        boundary_probs[:, 0] = 0.0
+        
         if attention_mask is not None:
             padding_mask = (attention_mask == 0)
-            boundary_logits = boundary_logits.masked_fill(padding_mask, SAFE_MASK_VALUE)
-            keep_logits = keep_logits.masked_fill(padding_mask, SAFE_MASK_VALUE)
+            boundary_probs = boundary_probs.masked_fill(padding_mask, 0.0)
+            keep_probs = keep_probs.masked_fill(padding_mask, 0.0)
         
-        # Compute probabilities
-        boundary_probs = torch.sigmoid(boundary_logits)
-        keep_probs = torch.sigmoid(keep_logits)
+        # Difficulty scores
+        difficulty_scores = self.difficulty_head(hidden).squeeze(-1)
         
         return PolicyOutput(
-            boundary_logits=boundary_logits,
+            boundary_importance=boundary_importance,
+            boundary_threshold=boundary_threshold,
             boundary_probs=boundary_probs,
-            keep_logits=keep_logits,
+            keep_importance=keep_importance,
+            keep_threshold=keep_threshold,
             keep_probs=keep_probs,
             hidden_states=hidden,
+            difficulty_scores=difficulty_scores,
         )
     
     def sample(
@@ -173,191 +266,165 @@ class BoundaryPolicy(nn.Module):
         num_samples: int = 1,
         temperature: float = 1.0,
         deterministic: bool = False,
-        max_context: Optional[int] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[list, PolicyOutput]:
         """
-        Sample (boundary, keep) configurations from the policy.
+        Sample boundary configurations.
         
         Args:
             x: (B, T, D) input embeddings
-            num_samples: Number of configurations to sample (G in GRPO)
-            temperature: Sampling temperature (higher = more random)
-            deterministic: If True, use threshold instead of sampling
-            max_context: Maximum total context (num_chunks + num_kept <= max_context)
-            attention_mask: (B, T) optional mask for valid tokens (1=valid, 0=padding)
+            num_samples: Number of configurations to sample
+            temperature: Additional temperature scaling
+            deterministic: If True, use threshold directly (no sampling)
+            attention_mask: (B, T) optional mask
             
         Returns:
-            samples: List of PolicySample, one per sample
+            samples: List of PolicySample
             policy_output: PolicyOutput from forward pass
         """
-        if max_context is None:
-            max_context = self.config.max_context
-            
         policy_output = self.forward(x, attention_mask=attention_mask)
         B, T = policy_output.boundary_probs.shape
-        device = x.device
+        
+        # Scale probs by additional temperature
+        if temperature != 1.0:
+            boundary_probs = self._rescale_probs(
+                policy_output.boundary_importance,
+                policy_output.boundary_threshold,
+                temperature * self.temperature
+            )
+            keep_probs = self._rescale_probs(
+                policy_output.keep_importance,
+                policy_output.keep_threshold,
+                temperature * self.temperature
+            )
+            boundary_probs[:, 0] = 0.0
+        else:
+            boundary_probs = policy_output.boundary_probs
+            keep_probs = policy_output.keep_probs
         
         samples = []
-        
         for _ in range(num_samples):
             if deterministic:
-                # Hard threshold at 0.5 (logit > 0)
-                boundaries = (policy_output.boundary_logits > 0).float()
-                keep_mask = (policy_output.keep_logits > 0).float()
+                # Hard threshold: importance > threshold
+                boundaries = (policy_output.boundary_importance > 
+                            policy_output.boundary_threshold.unsqueeze(1)).float()
+                keep_mask = (policy_output.keep_importance > 
+                           policy_output.keep_threshold.unsqueeze(1)).float()
+                boundaries[:, 0] = 0.0
             else:
-                # Sample from Bernoulli with temperature
-                # Apply temperature to logits (more stable than to probs)
-                scaled_boundary_logits = policy_output.boundary_logits / temperature
-                scaled_keep_logits = policy_output.keep_logits / temperature
-                boundary_probs = torch.sigmoid(scaled_boundary_logits)
-                keep_probs = torch.sigmoid(scaled_keep_logits)
+                # Sample from soft probabilities
                 boundaries = torch.bernoulli(boundary_probs)
                 keep_mask = torch.bernoulli(keep_probs)
             
-            # Enforce basic constraints
-            boundaries = self._apply_boundary_constraints(boundaries)
-            
-            # Enforce context limit: num_chunks + num_kept <= max_context
-            boundaries, keep_mask = self._apply_context_limit(
-                boundaries, keep_mask, max_context
+            # Apply budget constraint: at most max_context total
+            boundaries, keep_mask = self._apply_budget_constraint(
+                boundaries, keep_mask, 
+                policy_output.boundary_importance,
+                policy_output.keep_importance,
             )
             
-            # Compute log probability using LOGITS (numerically stable)
-            log_probs = self._compute_log_prob_from_logits(
+            # Compute log probability
+            log_probs = self._compute_log_prob(
                 boundaries, keep_mask,
-                policy_output.boundary_logits, policy_output.keep_logits
+                boundary_probs, keep_probs,
             )
             
             samples.append(PolicySample(
                 boundaries=boundaries,
                 keep_mask=keep_mask,
                 log_probs=log_probs,
-                boundary_logits=policy_output.boundary_logits,
-                keep_logits=policy_output.keep_logits,
-                boundary_probs=policy_output.boundary_probs,
-                keep_probs=policy_output.keep_probs,
+                boundary_probs=boundary_probs,
+                keep_probs=keep_probs,
             ))
         
         return samples, policy_output
     
-    def _apply_boundary_constraints(
+    def _rescale_probs(
         self,
-        boundaries: torch.Tensor,
+        importance: torch.Tensor,
+        threshold: torch.Tensor,
+        temperature: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Apply minimal boundary constraints.
-        First position is never a boundary.
-        """
-        boundaries[:, 0] = 0
-        return boundaries
+        """Recompute probs with different temperature."""
+        diff = importance - threshold.unsqueeze(1)
+        return torch.sigmoid(diff / temperature)
     
-    def _apply_context_limit(
+    def _apply_budget_constraint(
         self,
         boundaries: torch.Tensor,
         keep_mask: torch.Tensor,
-        max_context: int,
+        boundary_importance: torch.Tensor,
+        keep_importance: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Enforce: num_chunks + num_kept_tokens <= max_context
+        Ensure total context (boundaries + kept tokens) <= max_context.
         
-        Strategy: If over budget, reduce kept tokens first (they're optional),
-        then reduce chunks if still needed.
-        
-        OPTIMIZED: Still has loop over batch but minimized work inside loop.
-        Full vectorization is complex due to variable sparsity patterns.
+        Uses importance-based selection when over budget:
+        highest importance positions are kept.
         """
         B, T = boundaries.shape
-        device = boundaries.device
+        max_context = self.config.max_context
         
-        # Count chunks and kept tokens (vectorized)
-        num_chunks = boundaries.sum(dim=-1) + 1  # (B,) +1 for initial segment
-        num_kept = keep_mask.sum(dim=-1)  # (B,)
-        total = num_chunks + num_kept  # (B,)
-        
-        # Quick check: if no batch element exceeds limit, return early
-        over_budget = total > max_context
-        if not over_budget.any():
-            return boundaries, keep_mask
-        
-        # Only process batch elements that are over budget
-        over_indices = over_budget.nonzero(as_tuple=True)[0]
-        
-        for b in over_indices.tolist():
-            excess = int(total[b].item() - max_context)
+        for b in range(B):
+            # Count current usage
+            num_boundaries = boundaries[b].sum().int().item()
+            num_kept = keep_mask[b].sum().int().item()
+            # Each boundary creates a chunk, so num_chunks = num_boundaries + 1
+            total_context = (num_boundaries + 1) + num_kept
             
-            # Reduce kept tokens first
-            if num_kept[b] > 0 and excess > 0:
-                kept_indices = keep_mask[b].nonzero(as_tuple=True)[0]
-                num_to_remove = min(excess, len(kept_indices))
-                # Remove from the end (arbitrary but consistent)
-                remove_indices = kept_indices[-num_to_remove:]
-                keep_mask[b, remove_indices] = 0
+            if total_context <= max_context:
+                continue
+            
+            excess = total_context - max_context
+            
+            # First, reduce kept tokens (they're optional)
+            if num_kept > 0 and excess > 0:
+                kept_idx = keep_mask[b].nonzero(as_tuple=True)[0]
+                kept_importance_vals = keep_importance[b, kept_idx]
+                
+                # Remove lowest-importance kept tokens
+                num_to_remove = min(excess, len(kept_idx))
+                _, remove_order = kept_importance_vals.sort()
+                remove_idx = kept_idx[remove_order[:num_to_remove]]
+                keep_mask[b, remove_idx] = 0
                 excess -= num_to_remove
             
-            # If still over, remove boundaries
-            if excess > 0 and num_chunks[b] > 1:
-                boundary_indices = boundaries[b].nonzero(as_tuple=True)[0]
-                num_to_remove = min(excess, len(boundary_indices))
-                remove_indices = boundary_indices[-num_to_remove:]
-                boundaries[b, remove_indices] = 0
+            # Then, reduce boundaries if still over
+            if excess > 0 and num_boundaries > 0:
+                boundary_idx = boundaries[b].nonzero(as_tuple=True)[0]
+                boundary_importance_vals = boundary_importance[b, boundary_idx]
+                
+                # Remove lowest-importance boundaries
+                num_to_remove = min(excess, len(boundary_idx))
+                _, remove_order = boundary_importance_vals.sort()
+                remove_idx = boundary_idx[remove_order[:num_to_remove]]
+                boundaries[b, remove_idx] = 0
         
         return boundaries, keep_mask
     
-    def _compute_log_prob_from_logits(
+    def _compute_log_prob(
         self,
         boundaries: torch.Tensor,
         keep_mask: torch.Tensor,
-        boundary_logits: torch.Tensor,
-        keep_logits: torch.Tensor,
+        boundary_probs: torch.Tensor,
+        keep_probs: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute log probability of a (boundary, keep) configuration.
+        """Compute log probability of a (boundary, keep) configuration."""
+        # Clamp probs for numerical stability
+        eps = 1e-7
+        bp = boundary_probs.clamp(eps, 1 - eps)
+        kp = keep_probs.clamp(eps, 1 - eps)
         
-        NUMERICALLY STABLE: Uses logsigmoid instead of log(sigmoid(x)).
-        
-        log π(B, K|x) = Σ_t [log π(b_t|x) + log π(k_t|x)]
-        
-        For Bernoulli with logits:
-            log P(y=1) = logsigmoid(logit) = -softplus(-logit)
-            log P(y=0) = logsigmoid(-logit) = -softplus(logit)
-        
-        Args:
-            boundaries: (B, T) binary boundary indicators
-            keep_mask: (B, T) binary keep indicators
-            boundary_logits: (B, T) raw boundary logits (NOT probabilities!)
-            keep_logits: (B, T) raw keep logits (NOT probabilities!)
-            
-        Returns:
-            log_probs: (B,) log probability per sequence
-        """
-        # Clamp logits to prevent extreme values (±20 is plenty for sigmoid)
-        boundary_logits = boundary_logits.clamp(-20.0, 20.0)
-        keep_logits = keep_logits.clamp(-20.0, 20.0)
-        
-        # NUMERICALLY STABLE log-probability computation
-        # logsigmoid(x) = log(sigmoid(x)) = -softplus(-x), never overflows
-        # logsigmoid(-x) = log(1 - sigmoid(x)) = -softplus(x)
-        
-        # Log probability of boundary decisions: 
-        # P(b=1) when boundaries=1, P(b=0) when boundaries=0
+        # Log prob under Bernoulli
         boundary_log_probs = (
-            boundaries * F.logsigmoid(boundary_logits) +
-            (1 - boundaries) * F.logsigmoid(-boundary_logits)
+            boundaries * bp.log() + (1 - boundaries) * (1 - bp).log()
         )
-        
-        # Log probability of keep decisions
         keep_log_probs = (
-            keep_mask * F.logsigmoid(keep_logits) +
-            (1 - keep_mask) * F.logsigmoid(-keep_logits)
+            keep_mask * kp.log() + (1 - keep_mask) * (1 - kp).log()
         )
         
-        # Skip first position for boundaries (always 0, so log P = 0)
-        # Sum both to get total log prob
-        log_probs = (
-            boundary_log_probs[:, 1:].sum(dim=-1) +
-            keep_log_probs.sum(dim=-1)
-        )
+        # Sum over positions (skip first position for boundaries)
+        log_probs = boundary_log_probs[:, 1:].sum(dim=-1) + keep_log_probs.sum(dim=-1)
         
         # Normalize by sequence length for stability
         T = boundaries.size(1)
@@ -365,261 +432,235 @@ class BoundaryPolicy(nn.Module):
         
         return log_probs
     
+    def compress(
+        self,
+        hidden_states: torch.Tensor,
+        boundaries: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        keep_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Compress tokens into chunk embeddings at boundary positions.
+        
+        Args:
+            hidden_states: (B, T, D) from forward()
+            boundaries: (B, T) binary boundary indicators
+            attention_mask: (B, T) optional
+            keep_mask: (B, T) tokens to exclude (unused, kept for interface)
+            
+        Returns:
+            chunk_embeddings: (B, K, D)
+            chunk_mask: (B, K)
+            difficulty: (B, K)
+        """
+        B, T, D = hidden_states.shape
+        K = self.config.max_chunks
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        
+        # Project through compression head
+        compressed = self.compression_head(hidden_states)
+        difficulty_scores = self.difficulty_head(hidden_states).squeeze(-1)
+        
+        # Extract embeddings at boundary positions
+        chunk_embeddings = torch.zeros(B, K, D, device=device, dtype=dtype)
+        chunk_mask = torch.zeros(B, K, device=device, dtype=dtype)
+        chunk_difficulty = torch.zeros(B, K, device=device, dtype=dtype)
+        
+        for b in range(B):
+            boundary_positions = boundaries[b].nonzero(as_tuple=True)[0]
+            
+            # Add final position as implicit boundary
+            final_pos = torch.tensor([T - 1], device=device)
+            if len(boundary_positions) == 0:
+                all_boundaries = final_pos
+            elif boundary_positions[-1] != T - 1:
+                all_boundaries = torch.cat([boundary_positions, final_pos])
+            else:
+                all_boundaries = boundary_positions
+            
+            num_chunks = min(len(all_boundaries), K)
+            chunk_embeddings[b, :num_chunks] = compressed[b, all_boundaries[:num_chunks]]
+            chunk_mask[b, :num_chunks] = 1.0
+            chunk_difficulty[b, :num_chunks] = difficulty_scores[b, all_boundaries[:num_chunks]]
+        
+        chunk_mask[:, 0] = 1.0  # Always have at least one chunk
+        
+        return chunk_embeddings, chunk_mask, chunk_difficulty
+    
     def compute_grpo_loss(
         self,
         samples: list,
         rewards: torch.Tensor,
-        ref_policy_output: Optional['PolicyOutput'] = None,
+        ref_policy_output: Optional[PolicyOutput] = None,
+        chunk_difficulties: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Compute GRPO policy gradient loss with PPO-style ratio clipping.
-        
-        NUMERICALLY STABLE: Uses logits directly via logsigmoid.
-        
-        GRPO uses group-relative advantages (no value network needed):
-            A_i = (r_i - mean(r)) / (std(r) + eps)
-        
-        PPO clipped objective:
-            L = min(r_t * A_t, clip(r_t, 1-ε, 1+ε) * A_t)
-            
-        where r_t = π(a|s) / π_old(a|s) is the importance sampling ratio.
+        Compute GRPO policy gradient loss.
         
         Args:
-            samples: List of PolicySample from self.sample()
-            rewards: (G, B) rewards for each sample (negative LM loss)
-            ref_policy_output: PolicyOutput from reference policy forward pass
-                              (with boundary_logits and keep_logits for same input)
-            
-        Returns:
-            loss: Scalar GRPO loss
-            metrics: Dictionary of training metrics
+            samples: List of PolicySample
+            rewards: (G, B) rewards for each sample
+            ref_policy_output: Optional reference policy for KL
+            chunk_difficulties: (G, B, K) difficulty scores
         """
         G = len(samples)
         B = rewards.size(1) if rewards.dim() > 1 else 1
         device = rewards.device
         
-        # Reshape rewards to (G, B) if needed
         if rewards.dim() == 1:
             rewards = rewards.unsqueeze(1)
         
-        # Validate rewards don't contain NaN (fail fast, don't mask!)
-        assert not torch.isnan(rewards).any(), \
-            f"NaN detected in rewards! This indicates upstream numerical issues."
+        # Group-relative advantages
+        mean_r = rewards.mean(dim=0, keepdim=True)
+        std_r = rewards.std(dim=0, keepdim=True).clamp(min=1e-6)
         
-        # Compute group-relative advantages
-        mean_r = rewards.mean(dim=0, keepdim=True)  # (1, B)
-        std_r = rewards.std(dim=0, keepdim=True)  # (1, B)
-        
-        # Handle case where all rewards are identical (std=0)
-        # Use unbiased=False for single-sample std to avoid NaN
         if G == 1:
             advantages = torch.zeros_like(rewards)
         else:
-            std_r = std_r.clamp(min=1e-6)
-            advantages = (rewards - mean_r) / std_r  # (G, B)
+            advantages = ((rewards - mean_r) / std_r).clamp(-10.0, 10.0)
         
-        # Clamp advantages for stability (10 std is already extreme)
-        advantages = advantages.clamp(-10.0, 10.0)
+        # Collect log probabilities
+        log_probs = torch.stack([s.log_probs for s in samples], dim=0)
         
-        # Collect current log probabilities (already computed stably in sample())
-        log_probs = torch.stack([s.log_probs for s in samples], dim=0)  # (G, B)
-        
-        # Get clip range from config
-        clip_eps = self.config.grpo_clip_range  # Typically 0.2
-        
-        # Compute importance sampling ratio
+        # Policy gradient loss
         if ref_policy_output is not None:
-            # Compute reference policy log probs using REFERENCE policy's logits
-            # This is the CORRECT way - use ref policy's own probabilities!
+            # With reference policy (PPO-style clipping)
             ref_log_probs = []
             for sample in samples:
-                ref_lp = self._compute_log_prob_from_logits(
-                    sample.boundaries, sample.keep_mask,
-                    ref_policy_output.boundary_logits,  # Reference policy's logits!
-                    ref_policy_output.keep_logits,       # Reference policy's logits!
+                ref_bp = self._compute_ref_probs(
+                    sample.boundaries,
+                    ref_policy_output.boundary_importance,
+                    ref_policy_output.boundary_threshold,
+                )
+                ref_kp = self._compute_ref_probs(
+                    sample.keep_mask,
+                    ref_policy_output.keep_importance,
+                    ref_policy_output.keep_threshold,
+                )
+                ref_lp = self._compute_log_prob(
+                    sample.boundaries, sample.keep_mask, ref_bp, ref_kp
                 )
                 ref_log_probs.append(ref_lp)
-            ref_log_probs = torch.stack(ref_log_probs, dim=0)  # (G, B)
+            ref_log_probs = torch.stack(ref_log_probs, dim=0)
             
-            # Importance ratio in log space (numerically stable)
-            # r = exp(log_new - log_old), but we clamp the log difference first
             log_ratio = (log_probs - ref_log_probs).clamp(-10.0, 10.0)
-            ratio = torch.exp(log_ratio)  # (G, B)
+            ratio = torch.exp(log_ratio)
             
-            # PPO clipped objective
-            clipped_ratio = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-            surr1 = ratio * advantages
-            surr2 = clipped_ratio * advantages
-            pg_loss = -torch.min(surr1, surr2).mean()
-            
-            # KL divergence approximation (using log ratio directly)
+            clip_eps = self.config.grpo_clip_range
+            clipped_ratio = ratio.clamp(1.0 - clip_eps, 1.0 + clip_eps)
+            pg_loss = -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
             kl_approx = ((ratio - 1) - log_ratio).mean()
         else:
-            # No reference policy: vanilla policy gradient (REINFORCE style)
             pg_loss = -(advantages * log_probs).mean()
             ratio = torch.ones_like(log_probs)
             kl_approx = torch.tensor(0.0, device=device)
         
-        # KL penalty to reference policy
-        kl_loss = torch.tensor(0.0, device=device)
-        if ref_policy_output is not None and self.config.grpo_kl_coef > 0:
-            kl_loss = kl_approx * self.config.grpo_kl_coef
-        
-        # ENTROPY BONUS: Critical for preventing policy collapse!
-        # Maximizing entropy encourages exploration and prevents all-0 collapse
+        # Entropy bonus (encourages exploration)
         entropy_bonus = torch.tensor(0.0, device=device)
         entropy_weight = getattr(self.config, 'entropy_bonus_weight', 0.01)
         if entropy_weight > 0:
-            # Use LOGITS for numerically stable entropy computation
-            # Binary entropy: H = -[p*log(p) + (1-p)*log(1-p)]
-            #                   = -[sigmoid(x)*logsigmoid(x) + sigmoid(-x)*logsigmoid(-x)]
-            # But simpler: H = log(1 + exp(x)) + log(1 + exp(-x)) - x*sigmoid(x)
-            # Actually, even simpler using softplus:
-            # H = softplus(logit) + softplus(-logit) - |logit| * 0 ... 
-            # Let's use the stable formulation:
-            # H(p) = -p*log(p) - (1-p)*log(1-p) = BCE_with_logits(logit, sigmoid(logit))
-            # For Bernoulli: H = softplus(x) * sigmoid(-x) + softplus(-x) * sigmoid(x)
-            # Or equivalently: H = log(1 + exp(-|x|)) + |x| * sigmoid(-|x|)
-            
-            boundary_logits = samples[0].boundary_logits.clamp(-20.0, 20.0)
-            keep_logits = samples[0].keep_logits.clamp(-20.0, 20.0)
-            
-            # Stable binary entropy from logits:
-            # H = -p*log(p) - (1-p)*log(1-p)
-            #   = -sigmoid(x)*logsigmoid(x) - sigmoid(-x)*logsigmoid(-x)
-            bp = torch.sigmoid(boundary_logits)
-            kp = torch.sigmoid(keep_logits)
-            
-            boundary_entropy = -(bp * F.logsigmoid(boundary_logits) + 
-                                 (1 - bp) * F.logsigmoid(-boundary_logits))
-            keep_entropy = -(kp * F.logsigmoid(keep_logits) + 
-                            (1 - kp) * F.logsigmoid(-keep_logits))
-            
-            # We MAXIMIZE entropy by SUBTRACTING it from loss
+            bp = samples[0].boundary_probs.clamp(1e-7, 1 - 1e-7)
+            kp = samples[0].keep_probs.clamp(1e-7, 1 - 1e-7)
+            boundary_entropy = -(bp * bp.log() + (1 - bp) * (1 - bp).log())
+            keep_entropy = -(kp * kp.log() + (1 - kp) * (1 - kp).log())
             entropy_bonus = (boundary_entropy.mean() + keep_entropy.mean()) / 2
         
-        # MINIMUM CONTEXT USAGE: Prevent degenerate "do nothing" solutions
-        min_usage_penalty = torch.tensor(0.0, device=device)
-        min_usage = getattr(self.config, 'min_context_usage', 0.1)
-        min_usage_weight = getattr(self.config, 'min_usage_penalty_weight', 1.0)
-        if min_usage_weight > 0:
-            for sample in samples:
-                n_chunks = sample.boundaries.sum(dim=-1) + 1  # +1 for initial segment
-                n_kept = sample.keep_mask.sum(dim=-1)
-                total_context = n_chunks + n_kept
-                usage_ratio = total_context / self.config.max_context
-                
-                # Penalize if usage is below minimum
-                shortfall = torch.clamp(min_usage - usage_ratio, min=0)
-                min_usage_penalty = min_usage_penalty + shortfall.mean()
-            min_usage_penalty = min_usage_penalty / G
+        # ================================================================
+        # LOG BARRIER BUDGET CONSTRAINT
+        # ================================================================
+        # Uses interior point method: -log(K - expected) creates infinite
+        # penalty as expected approaches K, keeping the model in the
+        # feasible region (expected < K) at all times.
+        #
+        # Combined with Lagrangian price λ for smooth optimization.
+        # ================================================================
         
-        # Budget penalty: encourage target number of context slots used
-        budget_loss = torch.tensor(0.0, device=device)
-        if self.config.budget_penalty_weight > 0:
-            for sample in samples:
-                T = sample.boundaries.size(1)
-                n_chunks = sample.boundaries.sum(dim=-1) + 1
-                n_kept = sample.keep_mask.sum(dim=-1)
-                total_context = n_chunks + n_kept
-                target = self.config.max_context * 0.8
-                budget_violation = (total_context - target).abs()
-                budget_loss = budget_loss + budget_violation.mean()
-            budget_loss = budget_loss / G
+        λ = self.log_lambda.exp()  # Barrier strength (self-adjusting)
+        max_context = self.config.max_context
         
-        # Confidence loss: push probabilities toward 0 or 1 (minimize entropy)
-        # WARNING: Can cause collapse if used without entropy bonus
-        confidence_loss = torch.tensor(0.0, device=device)
-        confidence_weight = getattr(self.config, 'confidence_loss_weight', 0.0)
-        if confidence_weight > 0:
-            # Reuse entropy computation from above if available
-            if entropy_weight > 0:
-                # Already computed boundary_entropy and keep_entropy
-                confidence_loss = (boundary_entropy.mean() + keep_entropy.mean()) / 2
-            else:
-                # Compute stable entropy from logits
-                boundary_logits = samples[0].boundary_logits.clamp(-20.0, 20.0)
-                keep_logits = samples[0].keep_logits.clamp(-20.0, 20.0)
-                bp = torch.sigmoid(boundary_logits)
-                kp = torch.sigmoid(keep_logits)
-                
-                b_ent = -(bp * F.logsigmoid(boundary_logits) + 
-                         (1 - bp) * F.logsigmoid(-boundary_logits))
-                k_ent = -(kp * F.logsigmoid(keep_logits) + 
-                         (1 - kp) * F.logsigmoid(-keep_logits))
-                confidence_loss = (b_ent.mean() + k_ent.mean()) / 2
+        # Compute expected context usage across samples
+        expected_total = torch.tensor(0.0, device=device)
+        for sample in samples:
+            expected_boundaries = sample.boundary_probs.sum(dim=-1)  # (B,)
+            expected_kept = sample.keep_probs.sum(dim=-1)
+            expected_total = expected_total + (expected_boundaries + expected_kept).mean()
+        expected_total = expected_total / G
         
-        # Total loss: pg_loss + penalties - entropy_bonus (we MAXIMIZE entropy)
+        # Log barrier: -log(slack) where slack = K - expected
+        # Goes to infinity as expected approaches K from below
+        # We use a small buffer (0.95 * K) to keep some margin
+        effective_limit = max_context * 0.95  # Target 95% utilization max
+        slack = effective_limit - expected_total
+        
+        # Clamp slack to prevent log(0) or log(negative)
+        # If over budget, slack is negative -> use large penalty instead
+        min_slack = 1.0  # Minimum slack to prevent log explosion
+        
+        if slack > min_slack:
+            # Interior: use log barrier
+            # Normalized so penalty is ~0 when well under budget
+            log_barrier = -λ * torch.log(slack / effective_limit)
+        else:
+            # Exterior (over budget): massive penalty to push back
+            # Linear extrapolation from the barrier at min_slack
+            overshoot = min_slack - slack
+            barrier_at_min = -λ * torch.log(torch.tensor(min_slack / effective_limit, device=device))
+            gradient_at_min = λ / min_slack  # Derivative of -log(x)
+            log_barrier = barrier_at_min + gradient_at_min * overshoot * 10.0  # 10x steeper outside
+        
+        # Dual update: adjust λ based on constraint satisfaction
+        # Higher λ = stronger barrier = stay further from limit
+        with torch.no_grad():
+            utilization = expected_total / max_context
+            if utilization > 0.9:  # Getting close to limit
+                self.log_lambda.add_(0.05)  # Strengthen barrier
+            elif utilization < 0.5 and self.log_lambda.exp() > 0.5:
+                self.log_lambda.sub_(0.02)  # Relax barrier
+        
+        # Total loss
         total_loss = (
             pg_loss 
-            + self.config.budget_penalty_weight * budget_loss 
-            + confidence_weight * confidence_loss
-            + min_usage_weight * min_usage_penalty
-            - entropy_weight * entropy_bonus  # Subtract to maximize entropy
+            - entropy_weight * entropy_bonus 
+            + log_barrier
         )
         
-        # Validate no NaN in final loss (fail fast!)
-        assert not torch.isnan(total_loss), \
-            f"NaN in policy loss! pg={pg_loss.item():.4f}, budget={budget_loss.item():.4f}, " \
-            f"entropy={entropy_bonus.item():.4f}. Check upstream computations."
-        
-        # Compute clipping fraction for monitoring
-        clip_fraction = ((ratio - 1.0).abs() > clip_eps).float().mean()
-        
         # Metrics
-        mean_chunks = torch.stack([s.boundaries.sum(dim=-1) + 1 for s in samples]).float().mean().item()
-        mean_kept = torch.stack([s.keep_mask.sum(dim=-1) for s in samples]).float().mean().item()
-        
-        # Average tokens per chunk: (seq_len - kept_tokens) / num_chunks
-        seq_len = samples[0].boundaries.size(1)
-        tokens_in_chunks = seq_len - mean_kept
-        avg_tokens_per_chunk = tokens_in_chunks / max(mean_chunks, 1.0)  # Avoid div by zero
+        mean_chunks = sum((s.boundaries.sum(dim=-1) + 1).float().mean().item() for s in samples) / G
+        mean_kept = sum(s.keep_mask.sum(dim=-1).float().mean().item() for s in samples) / G
         
         metrics = {
             'policy/pg_loss': pg_loss.item(),
-            'policy/kl_approx': kl_approx.item() if torch.is_tensor(kl_approx) else kl_approx,
-            'policy/budget_loss': budget_loss.item(),
-            'policy/confidence_loss': confidence_loss.item(),
             'policy/entropy_bonus': entropy_bonus.item(),
-            'policy/min_usage_penalty': min_usage_penalty.item(),
+            'policy/log_barrier': log_barrier.item(),
+            'policy/barrier_strength': λ.item(),
+            'policy/expected_context': expected_total.item(),
+            'policy/budget_slack': slack.item() if torch.is_tensor(slack) else slack,
             'policy/total_loss': total_loss.item(),
             'policy/mean_reward': rewards.mean().item(),
-            'policy/std_reward': rewards.std().item(),
-            'policy/ratio_mean': ratio.mean().item(),
-            'policy/ratio_std': ratio.std().item(),
-            'policy/clip_fraction': clip_fraction.item(),
             'policy/mean_chunks': mean_chunks,
             'policy/mean_kept_tokens': mean_kept,
-            'policy/avg_tokens_per_chunk': avg_tokens_per_chunk,
             'policy/context_utilization': (mean_chunks + mean_kept) / self.config.max_context,
-            'policy/mean_advantage': advantages.mean().item(),
-            'policy/boundary_prob_mean': samples[0].boundary_probs.mean().item(),
-            'policy/boundary_prob_std': samples[0].boundary_probs.std().item(),
-            'policy/keep_prob_mean': samples[0].keep_probs.mean().item(),
+            'policy/temperature': self.temperature.item(),
+            'policy/kl_approx': kl_approx.item() if torch.is_tensor(kl_approx) else kl_approx,
         }
         
         return total_loss, metrics
     
-    def get_boundaries_deterministic(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Get deterministic boundaries for inference.
-        
-        Args:
-            x: (B, T, D) input embeddings
-            
-        Returns:
-            boundaries: (B, T) binary boundary indicators
-        """
-        samples, _ = self.sample(x, num_samples=1, deterministic=True)
-        return samples[0].boundaries
+    def _compute_ref_probs(
+        self,
+        decisions: torch.Tensor,
+        importance: torch.Tensor,
+        threshold: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute probabilities under reference policy."""
+        diff = importance - threshold.unsqueeze(1)
+        return torch.sigmoid(diff / self.temperature)
 
 
-class BoundaryPolicyWithProjection(nn.Module):
+class PolicyCompressorWithProjection(nn.Module):
     """
-    Boundary policy with input projection from pretrained model dimension.
-    
-    This wraps BoundaryPolicy with a projection layer to handle the dimension
-    mismatch between the pretrained model's hidden size and the policy's chunk_dim.
+    PolicyCompressor with input projection from pretrained model dimension.
     """
     
     def __init__(self, config: ContextExtenderConfig, pretrained_dim: int):
@@ -627,40 +668,44 @@ class BoundaryPolicyWithProjection(nn.Module):
         self.config = config
         self.pretrained_dim = pretrained_dim
         
-        # Project from pretrained dim to chunk dim
         self.input_proj = nn.Linear(pretrained_dim, config.chunk_dim)
         self.input_norm = nn.LayerNorm(config.chunk_dim)
-        
-        # Core policy
-        self.policy = BoundaryPolicy(config)
+        self.core = PolicyCompressor(config)
     
     def forward(
         self,
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> PolicyOutput:
-        """Forward pass with projection."""
         x = self.input_proj(x)
         x = self.input_norm(x)
-        return self.policy.forward(x, attention_mask=attention_mask)
+        return self.core.forward(x, attention_mask=attention_mask)
+    
+    def compress(
+        self,
+        hidden_states: torch.Tensor,
+        boundaries: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        keep_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.core.compress(hidden_states, boundaries, attention_mask, keep_mask)
+    
+    def compress_from_embeddings(
+        self,
+        embeddings: torch.Tensor,
+        boundaries: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        keep_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x = self.input_proj(embeddings)
+        x = self.input_norm(x)
+        hidden = self.core.backbone(x)
+        return self.core.compress(hidden, boundaries, attention_mask, keep_mask)
     
     def sample(self, x: torch.Tensor, **kwargs) -> Tuple[list, PolicyOutput]:
-        """Sample with projection."""
         x = self.input_proj(x)
         x = self.input_norm(x)
-        return self.policy.sample(x, **kwargs)
+        return self.core.sample(x, **kwargs)
     
     def compute_grpo_loss(self, *args, **kwargs):
-        """Delegate to policy."""
-        return self.policy.compute_grpo_loss(*args, **kwargs)
-    
-    def _apply_context_limit(self, *args, **kwargs):
-        """Delegate to policy."""
-        return self.policy._apply_context_limit(*args, **kwargs)
-    
-    def get_boundaries_deterministic(self, x: torch.Tensor) -> torch.Tensor:
-        """Get deterministic boundaries with projection."""
-        x = self.input_proj(x)
-        x = self.input_norm(x)
-        return self.policy.get_boundaries_deterministic(x)
-
+        return self.core.compute_grpo_loss(*args, **kwargs)

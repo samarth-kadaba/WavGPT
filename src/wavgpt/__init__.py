@@ -3,14 +3,15 @@
 This package extends pretrained transformer context windows by learning
 chunk boundaries via Group Relative Policy Optimization (GRPO).
 
-Key components:
+UNIFIED ARCHITECTURE:
+    - PolicyCompressor: Single network with shared SSM backbone
+      - Policy heads: boundary + keep decisions
+      - Compression head: chunk embeddings + difficulty scores
     - ContextExtender: Main model wrapping pretrained transformer
-    - BoundaryPolicy: Learns chunk boundaries via GRPO
-    - ChunkCompressor: Compresses token chunks into vectors
     - GRPOTrainer: Training loop for GRPO-based learning
 """
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 
 import torch
 
@@ -25,11 +26,12 @@ from wavgpt.models import (
     SelectiveSSM,
     SSMLayer,
     SSMBackbone,
-    # Policy
-    BoundaryPolicy,
-    BoundaryPolicyWithProjection,
-    # Compressor
-    ChunkCompressor,
+    # Policy-Compressor (unified)
+    PolicyCompressor,
+    PolicyCompressorWithProjection,
+    PolicySample,
+    PolicyOutput,
+    # Injector
     ChunkInjector,
     # Main model
     ContextExtender,
@@ -53,11 +55,12 @@ __all__ = [
     "SelectiveSSM",
     "SSMLayer",
     "SSMBackbone",
-    # Policy
-    "BoundaryPolicy",
-    "BoundaryPolicyWithProjection",
-    # Compressor
-    "ChunkCompressor",
+    # Policy-Compressor (unified)
+    "PolicyCompressor",
+    "PolicyCompressorWithProjection",
+    "PolicySample",
+    "PolicyOutput",
+    # Injector
     "ChunkInjector",
     # Main model
     "ContextExtender",

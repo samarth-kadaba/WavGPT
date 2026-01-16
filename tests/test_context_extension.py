@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for Context Extension via GRPO.
+Tests for Context Extension via GRPO with Unified Policy-Compressor.
 
 Run with: python -m pytest tests/test_context_extension.py -v
 """
@@ -16,11 +16,10 @@ from wavgpt import (
     SelectiveSSM,
     SSMLayer,
     SSMBackbone,
-    BoundaryPolicy,
-    ChunkCompressor,
+    PolicyCompressor,
+    PolicySample,
     ChunkInjector,
 )
-from wavgpt.models.policy import BoundarySample
 
 
 # =============================================================================
@@ -90,37 +89,44 @@ class TestSSMBackbone:
 
 
 # =============================================================================
-# Policy Tests
+# Unified Policy-Compressor Tests
 # =============================================================================
 
 
-class TestBoundaryPolicy:
-    """Tests for boundary policy."""
+class TestPolicyCompressor:
+    """Tests for unified policy-compressor."""
 
     def test_forward(self, config, device):
-        """Policy forward pass."""
-        policy = BoundaryPolicy(config).to(device)
+        """PolicyCompressor forward pass."""
+        policy = PolicyCompressor(config).to(device)
         x = torch.randn(2, 64, config.chunk_dim, device=device)
         
         output = policy.forward(x)
         
-        assert output.boundary_logits.shape == (2, 64)
+        assert output.boundary_importance.shape == (2, 64)
         assert output.boundary_probs.shape == (2, 64)
+        assert output.boundary_threshold.shape == (2,)
+        assert output.keep_importance.shape == (2, 64)
+        assert output.keep_probs.shape == (2, 64)
+        assert output.keep_threshold.shape == (2,)
         assert output.hidden_states.shape == x.shape
+        assert output.difficulty_scores.shape == (2, 64)
 
     def test_boundary_probs_range(self, config, device):
         """Boundary probabilities should be in [0, 1]."""
-        policy = BoundaryPolicy(config).to(device)
+        policy = PolicyCompressor(config).to(device)
         x = torch.randn(2, 64, config.chunk_dim, device=device)
         
         output = policy.forward(x)
         
         assert (output.boundary_probs >= 0).all()
         assert (output.boundary_probs <= 1).all()
+        assert (output.keep_probs >= 0).all()
+        assert (output.keep_probs <= 1).all()
 
     def test_first_position_no_boundary(self, config, device):
         """First position should never be a boundary."""
-        policy = BoundaryPolicy(config).to(device)
+        policy = PolicyCompressor(config).to(device)
         x = torch.randn(2, 64, config.chunk_dim, device=device)
         
         output = policy.forward(x)
@@ -129,165 +135,142 @@ class TestBoundaryPolicy:
         assert (output.boundary_probs[:, 0] < 0.01).all()
 
     def test_sample(self, config, device):
-        """Sampling should return valid boundary configurations."""
-        policy = BoundaryPolicy(config).to(device)
+        """Sampling should return valid configurations."""
+        policy = PolicyCompressor(config).to(device)
         x = torch.randn(2, 64, config.chunk_dim, device=device)
         
         samples, output = policy.sample(x, num_samples=3)
         
         assert len(samples) == 3
         for sample in samples:
-            assert isinstance(sample, BoundarySample)
+            assert isinstance(sample, PolicySample)
             assert sample.boundaries.shape == (2, 64)
+            assert sample.keep_mask.shape == (2, 64)
             assert sample.log_probs.shape == (2,)
             # Boundaries should be binary
             assert ((sample.boundaries == 0) | (sample.boundaries == 1)).all()
+            assert ((sample.keep_mask == 0) | (sample.keep_mask == 1)).all()
 
-    def test_deterministic_boundaries(self, config, device):
-        """Deterministic mode should give consistent results."""
-        policy = BoundaryPolicy(config).to(device)
-        policy.eval()
+    def test_compress(self, config, device):
+        """Compression should work from shared hidden states."""
+        policy = PolicyCompressor(config).to(device)
         x = torch.randn(2, 64, config.chunk_dim, device=device)
         
-        with torch.no_grad():
-            b1 = policy.get_boundaries_deterministic(x)
-            b2 = policy.get_boundaries_deterministic(x)
+        # Forward to get hidden states
+        output = policy.forward(x)
         
-        assert (b1 == b2).all()
+        # Create boundaries
+        boundaries = torch.zeros(2, 64, device=device)
+        boundaries[:, 15] = 1
+        boundaries[:, 31] = 1
+        boundaries[:, 47] = 1
+        
+        # Compress using shared hidden states
+        chunks, chunk_mask, difficulty = policy.compress(
+            output.hidden_states, boundaries
+        )
+        
+        assert chunks.shape == (2, config.max_chunks, config.chunk_dim)
+        assert chunk_mask.shape == (2, config.max_chunks)
+        assert difficulty.shape == (2, config.max_chunks)
 
     def test_grpo_loss(self, config, device):
-        """GRPO loss computation."""
-        policy = BoundaryPolicy(config).to(device)
+        """GRPO loss computation with difficulty."""
+        policy = PolicyCompressor(config).to(device)
         x = torch.randn(2, 64, config.chunk_dim, device=device)
         
-        samples, _ = policy.sample(x, num_samples=4)
+        samples, output = policy.sample(x, num_samples=4)
         
-        # Fake rewards
+        # Fake rewards and difficulties
         rewards = torch.randn(4, 2, device=device)
+        difficulties = [torch.randn(2, config.max_chunks, device=device) for _ in range(4)]
         
-        loss, metrics = policy.compute_grpo_loss(samples, rewards)
+        loss, metrics = policy.compute_grpo_loss(samples, rewards, chunk_difficulties=difficulties)
         
         assert loss.shape == ()
         assert not torch.isnan(loss)
         assert "policy/pg_loss" in metrics
         assert "policy/mean_reward" in metrics
+        assert "policy/log_barrier" in metrics
+        assert "policy/barrier_strength" in metrics
+        assert "policy/temperature" in metrics
 
 
-# =============================================================================
-# Compressor Tests
-# =============================================================================
+class TestChunkIndependence:
+    """Tests for boundary hidden state compression."""
 
-
-class TestChunkCompressor:
-    """Tests for chunk compressor."""
-
-    def test_forward(self, config, device):
-        """Compressor forward pass."""
-        input_dim = 128
-        compressor = ChunkCompressor(config, input_dim).to(device)
-        
-        tokens = torch.randn(2, 64, input_dim, device=device)
-        boundaries = torch.zeros(2, 64, device=device)
-        # Add some boundaries
-        boundaries[:, 15] = 1
-        boundaries[:, 31] = 1
-        boundaries[:, 47] = 1
-        
-        chunk_emb, chunk_mask = compressor(tokens, boundaries)
-        
-        # Now returns dynamic number of chunks, not max_chunks
-        num_chunks = int(boundaries.sum(dim=-1).max().item()) + 1  # 3 boundaries + 1 = 4 chunks
-        assert chunk_emb.shape == (2, num_chunks, config.chunk_dim)
-        assert chunk_mask.shape == (2, num_chunks)
-
-    def test_chunk_mask(self, config, device):
-        """Chunk mask should indicate valid chunks."""
-        input_dim = 128
-        compressor = ChunkCompressor(config, input_dim).to(device)
-        
-        tokens = torch.randn(2, 64, input_dim, device=device)
-        boundaries = torch.zeros(2, 64, device=device)
-        boundaries[:, 31] = 1  # Only one boundary
-        
-        _, chunk_mask = compressor(tokens, boundaries)
-        
-        # At least chunk 0 and 1 should be active
-        assert (chunk_mask[:, 0] > 0.5).all()
-        assert (chunk_mask[:, 1] > 0.5).all()
-
-    def test_chunk_independence(self, config, device):
+    def test_boundary_state_changes_with_input(self, config, device):
         """
-        CRITICAL TEST: Chunks must be processed independently.
+        Test that boundary hidden states change when input tokens change.
         
-        Changing tokens in chunk 0 should NOT affect chunk 1's embedding.
-        This verifies that the SSM state is reset between chunks.
+        With boundary hidden states (not mean pooling), the chunk embedding
+        is the SSM hidden state at the boundary position. This state depends
+        on all tokens before it, but due to SSM decay, recent tokens have
+        more influence than early tokens.
+        
+        We modify tokens NEAR the boundary to ensure visible change.
         """
-        input_dim = 128
-        compressor = ChunkCompressor(config, input_dim).to(device)
-        compressor.eval()
+        policy = PolicyCompressor(config).to(device)
+        policy.eval()
         
         # Create tokens with a boundary at position 31
-        tokens_a = torch.randn(1, 64, input_dim, device=device)
+        tokens_a = torch.randn(1, 64, config.chunk_dim, device=device)
         boundaries = torch.zeros(1, 64, device=device)
-        boundaries[:, 31] = 1  # Chunk 0: tokens 0-31, Chunk 1: tokens 32-63
+        boundaries[:, 31] = 1  # Chunk 0: ends at 31, Chunk 1: ends at 63
         
         # Get chunk embeddings for original tokens
         with torch.no_grad():
-            chunks_a, _ = compressor(tokens_a, boundaries)
+            output_a = policy.forward(tokens_a)
+            chunks_a, _, _ = policy.compress(output_a.hidden_states, boundaries)
         
-        # Modify ONLY chunk 0 tokens (positions 0-31)
+        # Modify tokens NEAR the boundary (positions 25-31)
+        # These have stronger influence on the boundary hidden state
         tokens_b = tokens_a.clone()
-        tokens_b[:, 0:16, :] = torch.randn(1, 16, input_dim, device=device)  # Modify first half of chunk 0
+        tokens_b[:, 25:32, :] = torch.randn(1, 7, config.chunk_dim, device=device)
         
         with torch.no_grad():
-            chunks_b, _ = compressor(tokens_b, boundaries)
+            output_b = policy.forward(tokens_b)
+            chunks_b, _, _ = policy.compress(output_b.hidden_states, boundaries)
         
-        # Chunk 0 should be DIFFERENT (we modified its tokens)
+        # Chunk 0 should change when we modify tokens before its boundary
         chunk0_diff = (chunks_a[:, 0, :] - chunks_b[:, 0, :]).abs().mean()
-        assert chunk0_diff > 0.01, f"Chunk 0 should change when its tokens change, diff={chunk0_diff}"
-        
-        # Chunk 1 should be IDENTICAL (we didn't modify its tokens)
-        chunk1_diff = (chunks_a[:, 1, :] - chunks_b[:, 1, :]).abs().mean()
-        assert chunk1_diff < 1e-5, f"Chunk 1 should NOT change when chunk 0 tokens change, diff={chunk1_diff}"
+        assert chunk0_diff > 0.01, f"Chunk 0 should change when tokens near boundary change, diff={chunk0_diff}"
 
-    def test_chunk_independence_multiple_chunks(self, config, device):
+    def test_chunk_count_with_boundaries(self, config, device):
         """
-        Test chunk independence with multiple chunks.
+        Test that N boundaries create N+1 chunks.
         
-        Modifying tokens in chunk 1 should not affect chunk 0 or chunk 2.
+        - Chunk 0 ends at first boundary
+        - Chunk 1 ends at second boundary
+        - ...
+        - Chunk N ends at sequence end (implicit boundary)
         """
-        input_dim = 128
-        compressor = ChunkCompressor(config, input_dim).to(device)
-        compressor.eval()
+        policy = PolicyCompressor(config).to(device)
+        policy.eval()
         
-        # Create 3 chunks: [0-20], [21-40], [41-63]
-        tokens_a = torch.randn(1, 64, input_dim, device=device)
+        # Create 2 explicit boundaries → should get 3 chunks
+        tokens_a = torch.randn(1, 64, config.chunk_dim, device=device)
         boundaries = torch.zeros(1, 64, device=device)
         boundaries[:, 20] = 1  # End of chunk 0
         boundaries[:, 40] = 1  # End of chunk 1
-        # Chunk 2 ends at 63 (implicit)
+        # Chunk 2 ends at position 63 (implicit)
         
         with torch.no_grad():
-            chunks_a, _ = compressor(tokens_a, boundaries)
+            output_a = policy.forward(tokens_a)
+            chunks_a, mask_a, diff_a = policy.compress(output_a.hidden_states, boundaries)
         
-        # Modify ONLY chunk 1 tokens (positions 21-40)
-        tokens_b = tokens_a.clone()
-        tokens_b[:, 25:35, :] = torch.randn(1, 10, input_dim, device=device)
+        # Verify we get 3 chunks marked as valid
+        assert mask_a[:, 0:3].sum() == 3, "Should have 3 valid chunks (2 explicit + 1 implicit)"
         
-        with torch.no_grad():
-            chunks_b, _ = compressor(tokens_b, boundaries)
-        
-        # Chunk 0 should be IDENTICAL
-        chunk0_diff = (chunks_a[:, 0, :] - chunks_b[:, 0, :]).abs().mean()
-        assert chunk0_diff < 1e-5, f"Chunk 0 should NOT change, diff={chunk0_diff}"
-        
-        # Chunk 1 should be DIFFERENT
-        chunk1_diff = (chunks_a[:, 1, :] - chunks_b[:, 1, :]).abs().mean()
-        assert chunk1_diff > 0.01, f"Chunk 1 should change, diff={chunk1_diff}"
-        
-        # Chunk 2 should be IDENTICAL
-        chunk2_diff = (chunks_a[:, 2, :] - chunks_b[:, 2, :]).abs().mean()
-        assert chunk2_diff < 1e-5, f"Chunk 2 should NOT change, diff={chunk2_diff}"
+        # Verify chunk embeddings are from correct positions
+        # Chunk 0 should be from position 20, Chunk 1 from 40, Chunk 2 from 63
+        expected_positions = [20, 40, 63]
+        compressed = policy.compression_head(output_a.hidden_states)
+        for i, pos in enumerate(expected_positions):
+            expected_embed = compressed[0, pos, :]
+            actual_embed = chunks_a[0, i, :]
+            diff = (expected_embed - actual_embed).abs().mean()
+            assert diff < 1e-5, f"Chunk {i} should be from position {pos}, diff={diff}"
 
 
 class TestChunkInjector:
@@ -317,7 +300,7 @@ class TestGradientFlow:
 
     def test_policy_gradients(self, config, device):
         """Gradients should flow to policy parameters."""
-        policy = BoundaryPolicy(config).to(device)
+        policy = PolicyCompressor(config).to(device)
         x = torch.randn(2, 32, config.chunk_dim, device=device, requires_grad=True)
         
         samples, output = policy.sample(x, num_samples=2)
@@ -328,20 +311,20 @@ class TestGradientFlow:
         
         loss.backward()
         
-        # Boundary head should have gradients (renamed from policy_head)
-        assert policy.boundary_head[0].weight.grad is not None
-        assert not torch.isnan(policy.boundary_head[0].weight.grad).any()
+        # Importance head should have gradients
+        assert policy.importance_head[0].weight.grad is not None
+        assert not torch.isnan(policy.importance_head[0].weight.grad).any()
 
     def test_compressor_gradients(self, config, device):
-        """Gradients should flow through compressor."""
-        input_dim = 64
-        compressor = ChunkCompressor(config, input_dim).to(device)
+        """Gradients should flow through compression."""
+        policy = PolicyCompressor(config).to(device)
         
-        tokens = torch.randn(2, 32, input_dim, device=device, requires_grad=True)
+        tokens = torch.randn(2, 32, config.chunk_dim, device=device, requires_grad=True)
         boundaries = torch.zeros(2, 32, device=device)
         boundaries[:, 15] = 1
         
-        chunks, mask = compressor(tokens, boundaries)
+        output = policy.forward(tokens)
+        chunks, mask, diff = policy.compress(output.hidden_states, boundaries)
         loss = chunks.sum()
         loss.backward()
         
@@ -381,4 +364,3 @@ class TestGRPOTraining:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

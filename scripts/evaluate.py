@@ -41,7 +41,14 @@ def load_model(checkpoint_path: str, device: str = "cuda"):
     ).to(device)
     
     if "model_state_dict" in ckpt:
-        model.load_state_dict(ckpt["model_state_dict"])
+        state_dict = ckpt["model_state_dict"]
+        # Handle torch.compile _orig_mod prefix
+        # Strip "_orig_mod." from keys if present
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace("._orig_mod.", ".").replace("_orig_mod.", "")
+            new_state_dict[new_key] = v
+        model.load_state_dict(new_state_dict, strict=False)
     
     model.eval()
     
@@ -154,26 +161,16 @@ def analyze_chunks(model, tokenizer, text: str, device: str = "cuda", max_displa
     # Get embeddings
     embeddings = model.get_embeddings(input_ids)
     
-    # Get policy decisions
-    policy_output = model.policy.forward(embeddings)
+    # Get policy decisions using the sample() method
+    samples, policy_output = model.policy.sample(embeddings, num_samples=1, deterministic=False)
+    sample = samples[0]
+    
+    boundaries = sample.boundaries[0]  # (T,)
+    keep_mask = sample.keep_mask[0]  # (T,)
     boundary_probs = policy_output.boundary_probs[0]  # (T,)
     keep_probs = policy_output.keep_probs[0]  # (T,)
     
-    # Get discrete decisions using SAMPLING (like training does!)
-    # NOT deterministic thresholding - that's wrong for this model
-    boundaries = torch.bernoulli(boundary_probs)
-    keep_mask = torch.bernoulli(keep_probs)
-    
-    # Apply context limit
-    boundaries_2d = boundaries.unsqueeze(0)
-    keep_mask_2d = keep_mask.unsqueeze(0)
-    boundaries_2d, keep_mask_2d = model.policy._apply_context_limit(
-        boundaries_2d, keep_mask_2d, model.config.max_context
-    )
-    boundaries = boundaries_2d[0]
-    keep_mask = keep_mask_2d[0]
-    
-    # Also compute expected values for reference
+    # Compute expected values for reference
     expected_boundaries = boundary_probs.sum().item()
     expected_kept = keep_probs.sum().item()
     
@@ -340,10 +337,17 @@ def analyze_chunks(model, tokenizer, text: str, device: str = "cuda", max_displa
     # PROBABILITY STATISTICS
     # ════════════════════════════════════════════════════════════════════
     print(f"\n┌{'─'*68}┐")
-    print(f"│{'POLICY PROBABILITY STATISTICS':^68}│")
+    print(f"│{'POLICY STATISTICS':^68}│")
     print(f"├{'─'*68}┤")
+    
+    # Get importance and threshold info
+    importance = policy_output.boundary_importance[0]
+    threshold = policy_output.boundary_threshold[0].item()
+    
     print(f"│  Boundary probs:  mean={boundary_probs.mean().item():.3f}  std={boundary_probs.std().item():.3f}  max={boundary_probs.max().item():.3f}{' '*12}│")
     print(f"│  Keep probs:      mean={keep_probs.mean().item():.3f}  std={keep_probs.std().item():.3f}  max={keep_probs.max().item():.3f}{' '*12}│")
+    print(f"│  Importance:      mean={importance.mean().item():.3f}  std={importance.std().item():.3f}  range=[{importance.min().item():.2f}, {importance.max().item():.2f}]│")
+    print(f"│  Threshold:       {threshold:.3f} (positions above this → boundary){' '*19}│")
     print(f"└{'─'*68}┘")
     
     return {
@@ -381,6 +385,9 @@ def main():
     # Test text
     parser.add_argument("--text", type=str, default=None, help="Text for perplexity/analysis")
     
+    # Display options
+    parser.add_argument("--max-display", type=int, default=10, help="Max chunks to display (use -1 for all)")
+    
     args = parser.parse_args()
     
     # Load model
@@ -414,7 +421,8 @@ def main():
         print(f"Current window: {result['current_window_size']} tokens")
     
     if args.analyze:
-        analyze_chunks(model, tokenizer, test_text, args.device)
+        max_disp = args.max_display if args.max_display >= 0 else 999999
+        analyze_chunks(model, tokenizer, test_text, args.device, max_display=max_disp)
     
     if args.generate:
         generate_text(
