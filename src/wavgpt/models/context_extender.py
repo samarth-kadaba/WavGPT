@@ -57,6 +57,7 @@ class ContextExtenderOutput:
     keep_mask: torch.Tensor                 # (B, T) keep indicators
     boundary_probs: torch.Tensor            # (B, T) boundary probabilities
     keep_probs: torch.Tensor                # (B, T) keep probabilities
+    context_type: Optional[torch.Tensor] = None  # (L,) 0=chunk, 1=kept
     difficulty_scores: Optional[torch.Tensor] = None  # (B, K) chunk difficulties
 
 
@@ -309,26 +310,33 @@ class ContextExtender(nn.Module):
         
         logits = outputs.logits
         
-        # Compute LM loss on kept tokens
+        # Compute LM loss: predict LITERAL next token (not next kept token)
+        # For each kept token at original position i, predict token at position i+1
         loss = None
-        if labels is not None and M > 1:
-            kept_labels = labels[:, kept_indices]
-            kept_positions = (context_type == 1).nonzero(as_tuple=True)[0]
+        if labels is not None and M > 0:
+            kept_positions = (context_type == 1).nonzero(as_tuple=True)[1]
             num_kept_in_context = len(kept_positions)
             
-            if num_kept_in_context > 1:
-                kept_logits = logits[:, kept_positions, :]
-                min_len = min(num_kept_in_context, M)
-                kept_logits = kept_logits[:, :min_len, :]
-                kept_labels = kept_labels[:, :min_len]
+            if num_kept_in_context > 0:
+                # For each kept index i, we predict token at i+1
+                kept_indices_tensor = torch.tensor(kept_indices, device=device)
+                next_indices = kept_indices_tensor + 1
+                valid_mask = next_indices < T
                 
-                shift_logits = kept_logits[:, :-1, :].contiguous()
-                shift_labels = kept_labels[:, 1:].contiguous()
-                
-                if shift_logits.size(1) > 0:
+                if valid_mask.sum() > 0:
+                    # Get logits at kept positions (predicting next token)
+                    kept_logits = logits[:, kept_positions, :]
+                    
+                    # Only use positions where next token exists
+                    valid_logits = kept_logits[:, valid_mask, :]
+                    valid_next_indices = next_indices[valid_mask]
+                    
+                    # Labels are the NEXT tokens in original sequence
+                    next_labels = labels[:, valid_next_indices]
+                    
                     loss = F.cross_entropy(
-                        shift_logits.view(-1, self.vocab_size),
-                        shift_labels.view(-1),
+                        valid_logits.reshape(-1, self.vocab_size),
+                        next_labels.reshape(-1),
                         ignore_index=-100,
                     )
         
@@ -343,6 +351,7 @@ class ContextExtender(nn.Module):
             keep_mask=keep_mask,
             boundary_probs=policy_output.boundary_probs,
             keep_probs=policy_output.keep_probs,
+            context_type=context_type,
             difficulty_scores=chunk_difficulty,
         )
     
@@ -472,6 +481,7 @@ class ContextExtender(nn.Module):
             keep_mask=keep_mask,
             boundary_probs=boundary_probs,
             keep_probs=keep_probs,
+            context_type=torch.ones(T, dtype=torch.long, device=device),  # All kept
             difficulty_scores=difficulty_scores,
         )
     
@@ -612,25 +622,27 @@ class ContextExtender(nn.Module):
             
             logits_g = all_logits[g, :, :L_g, :]
             
+            # Compute loss: predict LITERAL next token (not next kept token)
+            # For each kept token at original position i, predict token at position i+1
             loss = None
-            if labels is not None and M > 1:
-                kept_labels = labels[:, kept_indices]
+            if labels is not None and M > 0:
                 kept_positions = (context_type == 1).nonzero(as_tuple=True)[0]
                 num_kept_in_context = len(kept_positions)
                 
-                if num_kept_in_context > 1:
-                    kept_logits = logits_g[:, kept_positions, :]
-                    min_len = min(num_kept_in_context, M)
-                    kept_logits = kept_logits[:, :min_len, :]
-                    kept_labels = kept_labels[:, :min_len]
+                if num_kept_in_context > 0:
+                    kept_indices_tensor = torch.tensor(kept_indices, device=device)
+                    next_indices = kept_indices_tensor + 1
+                    valid_mask = next_indices < T
                     
-                    shift_logits = kept_logits[:, :-1, :].contiguous()
-                    shift_labels = kept_labels[:, 1:].contiguous()
-                    
-                    if shift_logits.size(1) > 0:
+                    if valid_mask.sum() > 0:
+                        kept_logits = logits_g[:, kept_positions, :]
+                        valid_logits = kept_logits[:, valid_mask, :]
+                        valid_next_indices = next_indices[valid_mask]
+                        next_labels = labels[:, valid_next_indices]
+                        
                         loss_per_token = F.cross_entropy(
-                            shift_logits.view(-1, self.vocab_size),
-                            shift_labels.view(-1),
+                            valid_logits.reshape(-1, self.vocab_size),
+                            next_labels.reshape(-1),
                             ignore_index=-100,
                             reduction='none',
                         )
@@ -703,69 +715,52 @@ class ContextExtender(nn.Module):
         top_k: Optional[int] = 50,
         top_p: Optional[float] = 0.9,
     ) -> torch.Tensor:
-        """Generate tokens with dynamic chunking."""
+        """
+        Generate tokens using EXACT same flow as training forward().
+        
+        For each token generation step:
+        1. Run forward() to get logits (uses same policy/compression as training)
+        2. Sample next token from logits
+        3. Append and repeat
+        """
         self.eval()
         B = input_ids.size(0)
         device = input_ids.device
         
         generated = input_ids.clone()
-        chunks = []
-        segment_start = 0
         
         for _ in range(max_new_tokens):
-            current_len = generated.size(1)
-            current_segment_len = current_len - segment_start
-            num_chunks = len(chunks)
-            
-            # Check if we need to chunk
-            if num_chunks + current_segment_len >= self.config.max_context:
-                # Get hidden states for segment
-                segment_ids = generated[:, segment_start:current_len]
-                hidden = self.get_hidden_states(segment_ids)
-                
-                # Project through policy input projection
-                hidden_proj = self.policy.input_proj(hidden)
-                hidden_proj = self.policy.input_norm(hidden_proj)
-                hidden_processed = self.policy.core.backbone(hidden_proj)
-                
-                # Create boundary at end
-                seg_boundaries = torch.zeros(B, current_len - segment_start, device=device)
-                seg_boundaries[:, -1] = 1.0
-                
-                chunk, _, _ = self.policy.core.compress(
-                    hidden_processed, seg_boundaries, None, None
-                )
-                chunks.append(chunk[:, 0, :])
-                segment_start = current_len
-            
-            # Build context
-            current_segment = generated[:, segment_start:]
-            current_embeds = self.get_embeddings(current_segment)
-            
-            if chunks:
-                chunk_tensor = torch.stack(chunks, dim=1)
-                virtual_tokens, virtual_mask = self.injector(
-                    chunk_tensor, 
-                    torch.ones(B, len(chunks), device=device)
-                )
-                combined = torch.cat([virtual_tokens, current_embeds], dim=1)
-            else:
-                combined = current_embeds
-            
-            outputs = self._forward_pretrained(
-                inputs_embeds=combined,
-                num_virtual_tokens=len(chunks),
+            # Use forward() for EXACT training parity
+            # This runs the full policy + compression + interleaving
+            outputs = self.forward(
+                input_ids=generated,
+                attention_mask=None,
+                labels=None,  # No labels for generation
+                use_deterministic_boundaries=True,
             )
             
-            next_token_logits = outputs.logits[:, -1, :]
+            # Find the last KEPT position (context_type == 1)
+            # Training only computes loss on kept positions, so only they predict next tokens
+            context_type = outputs.context_type
+            kept_positions = (context_type == 1).nonzero(as_tuple=True)[0]
             
+            if len(kept_positions) > 0:
+                last_kept_idx = kept_positions[-1]
+                next_token_logits = outputs.logits[:, last_kept_idx, :]
+            else:
+                # Fallback: use last position if no kept tokens
+                next_token_logits = outputs.logits[:, -1, :]
+            
+            # Apply temperature
             if temperature != 1.0:
                 next_token_logits = next_token_logits / temperature
             
+            # Apply top-k filtering
             if top_k is not None:
                 indices_to_remove = next_token_logits < torch.topk(next_token_logits, top_k)[0][..., -1, None]
                 next_token_logits[indices_to_remove] = float('-inf')
             
+            # Apply top-p (nucleus) filtering
             if top_p is not None:
                 sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
                 cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
@@ -775,16 +770,100 @@ class ContextExtender(nn.Module):
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 next_token_logits[indices_to_remove] = float('-inf')
             
+            # Sample next token
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
             generated = torch.cat([generated, next_token], dim=1)
             
+            # Check for EOS
             if hasattr(self.pretrained.config, 'eos_token_id'):
                 if (next_token == self.pretrained.config.eos_token_id).all():
                     break
         
         return generated
+    
+    @torch.no_grad()
+    def _compress_with_policy(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        """
+        Compress input sequence using the learned policy.
+        
+        THIS MUST MATCH TRAINING EXACTLY:
+        1. Get hidden_states (not just embeddings)
+        2. Run policy.sample on hidden_states
+        3. Compress using policy.compress
+        
+        Returns:
+            chunk_embeddings: (B, K, D) compressed chunk representations
+            chunk_mask: (B, K) valid chunk mask
+            current_window_start: position where current window begins
+        """
+        B, T = input_ids.shape
+        device = input_ids.device
+        
+        # MATCH TRAINING: Get rich hidden states, not just embeddings
+        hidden_states = self.get_hidden_states(input_ids, attention_mask)
+        
+        # Use the learned policy to decide boundaries (deterministic for generation)
+        samples, policy_output = self.policy.sample(
+            hidden_states,  # MUST be hidden_states to match training
+            num_samples=1, 
+            deterministic=True,
+            attention_mask=attention_mask,
+        )
+        sample = samples[0]
+        boundaries = sample.boundaries  # (B, T)
+        keep_mask = sample.keep_mask    # (B, T)
+        
+        # Find the last boundary position for each sequence
+        # Everything after the last boundary is the current window
+        last_boundary_pos = torch.zeros(B, dtype=torch.long, device=device)
+        for b in range(B):
+            boundary_positions = boundaries[b].nonzero(as_tuple=True)[0]
+            if len(boundary_positions) > 0:
+                last_boundary_pos[b] = boundary_positions[-1].item() + 1
+            else:
+                # No boundaries - everything is current window
+                last_boundary_pos[b] = 0
+        
+        # Use the minimum last boundary position across batch for simplicity
+        current_window_start = last_boundary_pos.min().item()
+        
+        if current_window_start == 0:
+            # No compression needed
+            return None, None, 0
+        
+        # Compress the past (before current_window_start)
+        past_ids = input_ids[:, :current_window_start]
+        past_mask = attention_mask[:, :current_window_start] if attention_mask is not None else None
+        
+        # MATCH TRAINING: Get hidden states for past portion
+        past_hidden_states = self.get_hidden_states(past_ids, past_mask)
+        
+        # Re-run policy on just the past portion
+        past_samples, past_policy_output = self.policy.sample(
+            past_hidden_states,  # MUST be hidden_states
+            num_samples=1,
+            deterministic=True,
+            attention_mask=past_mask,
+        )
+        past_sample = past_samples[0]
+        past_boundaries = past_sample.boundaries
+        past_keep_mask = past_sample.keep_mask
+        
+        # MATCH TRAINING: Compress using policy.compress with hidden_states
+        chunk_embeddings, chunk_mask, _ = self.policy.compress(
+            past_policy_output.hidden_states,
+            past_boundaries,
+            attention_mask=past_mask,
+            keep_mask=past_keep_mask,
+        )
+        
+        return chunk_embeddings, chunk_mask, current_window_start
     
     def get_num_params(self, trainable_only: bool = True) -> int:
         """Get number of parameters."""

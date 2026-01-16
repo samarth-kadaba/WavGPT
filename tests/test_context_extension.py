@@ -191,8 +191,8 @@ class TestPolicyCompressor:
         assert not torch.isnan(loss)
         assert "policy/pg_loss" in metrics
         assert "policy/mean_reward" in metrics
-        assert "policy/log_barrier" in metrics
-        assert "policy/barrier_strength" in metrics
+        assert "policy/budget_penalty" in metrics
+        assert "policy/expected_context" in metrics
         assert "policy/temperature" in metrics
 
 

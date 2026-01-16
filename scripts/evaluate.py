@@ -81,7 +81,7 @@ def evaluate_perplexity(model, tokenizer, text: str, device: str = "cuda"):
         "perplexity": ppl,
         "loss": outputs.loss.item() if outputs.loss is not None else None,
         "num_chunks": outputs.num_chunks,
-        "current_window_size": outputs.current_window_size,
+        "num_kept_tokens": outputs.num_kept_tokens,
         "num_boundaries": outputs.boundaries.sum().item(),
     }
 
@@ -418,7 +418,7 @@ def main():
         print(f"\nPerplexity: {result['perplexity']:.2f}")
         print(f"Loss: {result['loss']:.4f}")
         print(f"Chunks used: {result['num_chunks']}")
-        print(f"Current window: {result['current_window_size']} tokens")
+        print(f"Kept tokens: {result['num_kept_tokens']} tokens")
     
     if args.analyze:
         max_disp = args.max_display if args.max_display >= 0 else 999999

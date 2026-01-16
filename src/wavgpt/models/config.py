@@ -65,12 +65,35 @@ class ContextExtenderConfig:
     # Entropy bonus (prevents policy collapse)
     entropy_bonus_weight: float = 0.05
     
-    # Difficulty-based credit assignment
-    # Penalizes high difficulty when performance is bad
-    difficulty_loss_weight: float = 0.1
+    # Budget utilization constraint
+    # Target utilization as fraction of max_context (e.g., 0.95 = 95%)
+    target_utilization_ratio: float = 0.95
+    # Penalty strength for exceeding max_context (should be ~1-10x LM loss scale)
+    over_budget_penalty: float = 10.0
+    # Penalty strength for under-utilizing budget
+    under_budget_penalty: float = 1.0
+    # Barrier strength bounds (Lagrangian multiplier)
+    lambda_min: float = 0.1
+    lambda_max: float = 10.0
+    # Dual update rates for barrier strength
+    lambda_increase_rate: float = 0.01
+    lambda_decrease_rate: float = 0.005
+    # Utilization threshold for adjusting barrier
+    low_utilization_threshold: float = 0.8
     
-    # Budget penalty (encourages staying under max_context)
-    budget_penalty_weight: float = 0.1
+    # Initial threshold biases
+    initial_keep_threshold_bias: float = 1.0
+    
+    # Temperature bounds (prevents numerical instability)
+    temperature_min: float = 0.1
+    temperature_max: float = 10.0
+    
+    # Position encoding scale (higher = more frequency variation)
+    position_scale: float = 1000.0
+    
+    # Numerical stability clamps
+    advantage_clamp: float = 10.0
+    log_ratio_clamp: float = 10.0
     
     # GRPO settings
     grpo_num_samples: int = 4

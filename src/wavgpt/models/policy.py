@@ -64,9 +64,10 @@ class PolicyOutput:
 class SinusoidalPositionEncoding(nn.Module):
     """Sinusoidal position encoding with normalized positions [0, 1]."""
     
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, position_scale: float = 1000.0):
         super().__init__()
         self.dim = dim
+        self.position_scale = position_scale
         
         # Precompute frequency bands
         inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
@@ -80,7 +81,7 @@ class SinusoidalPositionEncoding(nn.Module):
             (T, D) or (B, T, D) position embeddings
         """
         # Scale to reasonable range for sinusoids
-        positions = positions * 1000  # Scale up for frequency variation
+        positions = positions * self.position_scale
         
         if positions.dim() == 1:
             # (T,) -> (T, D//2)
@@ -123,7 +124,9 @@ class PolicyCompressor(nn.Module):
         )
         
         # Position encoding
-        self.pos_encoder = SinusoidalPositionEncoding(config.chunk_dim)
+        self.pos_encoder = SinusoidalPositionEncoding(
+            config.chunk_dim, position_scale=config.position_scale
+        )
         self.pos_proj = nn.Linear(config.chunk_dim, config.chunk_dim)
         
         # Importance head: how important is a boundary at each position?
@@ -185,12 +188,14 @@ class PolicyCompressor(nn.Module):
         # Start with threshold ≈ 0, so about half of positions are above
         with torch.no_grad():
             self.threshold_head[-1].bias.fill_(0.0)
-            self.keep_threshold_head[-1].bias.fill_(1.0)  # Keep tokens more conservatively
+            self.keep_threshold_head[-1].bias.fill_(self.config.initial_keep_threshold_bias)
     
     @property
     def temperature(self) -> torch.Tensor:
         """Clamped temperature for numerical stability."""
-        return self.log_temperature.exp().clamp(0.1, 10.0)
+        return self.log_temperature.exp().clamp(
+            self.config.temperature_min, self.config.temperature_max
+        )
     
     def forward(
         self,
@@ -518,7 +523,8 @@ class PolicyCompressor(nn.Module):
         if G == 1:
             advantages = torch.zeros_like(rewards)
         else:
-            advantages = ((rewards - mean_r) / std_r).clamp(-10.0, 10.0)
+            adv_clamp = self.config.advantage_clamp
+            advantages = ((rewards - mean_r) / std_r).clamp(-adv_clamp, adv_clamp)
         
         # Collect log probabilities
         log_probs = torch.stack([s.log_probs for s in samples], dim=0)
@@ -544,7 +550,8 @@ class PolicyCompressor(nn.Module):
                 ref_log_probs.append(ref_lp)
             ref_log_probs = torch.stack(ref_log_probs, dim=0)
             
-            log_ratio = (log_probs - ref_log_probs).clamp(-10.0, 10.0)
+            lr_clamp = self.config.log_ratio_clamp
+            log_ratio = (log_probs - ref_log_probs).clamp(-lr_clamp, lr_clamp)
             ratio = torch.exp(log_ratio)
             
             clip_eps = self.config.grpo_clip_range
@@ -567,17 +574,18 @@ class PolicyCompressor(nn.Module):
             entropy_bonus = (boundary_entropy.mean() + keep_entropy.mean()) / 2
         
         # ================================================================
-        # LOG BARRIER BUDGET CONSTRAINT
+        # BUDGET UTILIZATION CONSTRAINT
         # ================================================================
-        # Uses interior point method: -log(K - expected) creates infinite
-        # penalty as expected approaches K, keeping the model in the
-        # feasible region (expected < K) at all times.
-        #
-        # Combined with Lagrangian price λ for smooth optimization.
+        # We WANT 100% utilization! The model should use the full budget.
+        # 
+        # - Penalize going OVER the limit (hard constraint)
+        # - Penalize going UNDER the target (encourage full usage)
         # ================================================================
         
-        λ = self.log_lambda.exp()  # Barrier strength (self-adjusting)
-        max_context = self.config.max_context
+        cfg = self.config
+        λ = self.log_lambda.exp().clamp(cfg.lambda_min, cfg.lambda_max)
+        max_context = cfg.max_context
+        target_utilization = max_context * cfg.target_utilization_ratio
         
         # Compute expected context usage across samples
         expected_total = torch.tensor(0.0, device=device)
@@ -587,42 +595,37 @@ class PolicyCompressor(nn.Module):
             expected_total = expected_total + (expected_boundaries + expected_kept).mean()
         expected_total = expected_total / G
         
-        # Log barrier: -log(slack) where slack = K - expected
-        # Goes to infinity as expected approaches K from below
-        # We use a small buffer (0.95 * K) to keep some margin
-        effective_limit = max_context * 0.95  # Target 95% utilization max
-        slack = effective_limit - expected_total
+        # OVER-BUDGET PENALTY: Strong quadratic penalty for exceeding max
+        # This is a hard constraint - never exceed the limit
+        over_budget = F.relu(expected_total - max_context) / max_context
+        over_penalty = over_budget * over_budget * cfg.over_budget_penalty
         
-        # Clamp slack to prevent log(0) or log(negative)
-        # If over budget, slack is negative -> use large penalty instead
-        min_slack = 1.0  # Minimum slack to prevent log explosion
+        # UNDER-BUDGET PENALTY: Encourage using the full budget
+        # Penalize the gap between expected and target
+        under_budget = F.relu(target_utilization - expected_total) / max_context
+        under_penalty = λ * under_budget * under_budget * cfg.under_budget_penalty
         
-        if slack > min_slack:
-            # Interior: use log barrier
-            # Normalized so penalty is ~0 when well under budget
-            log_barrier = -λ * torch.log(slack / effective_limit)
-        else:
-            # Exterior (over budget): massive penalty to push back
-            # Linear extrapolation from the barrier at min_slack
-            overshoot = min_slack - slack
-            barrier_at_min = -λ * torch.log(torch.tensor(min_slack / effective_limit, device=device))
-            gradient_at_min = λ / min_slack  # Derivative of -log(x)
-            log_barrier = barrier_at_min + gradient_at_min * overshoot * 10.0  # 10x steeper outside
+        budget_penalty = over_penalty + under_penalty
         
-        # Dual update: adjust λ based on constraint satisfaction
-        # Higher λ = stronger barrier = stay further from limit
+        # Dual update: adjust λ to encourage full utilization
         with torch.no_grad():
             utilization = expected_total / max_context
-            if utilization > 0.9:  # Getting close to limit
-                self.log_lambda.add_(0.05)  # Strengthen barrier
-            elif utilization < 0.5 and self.log_lambda.exp() > 0.5:
-                self.log_lambda.sub_(0.02)  # Relax barrier
+            if utilization < cfg.low_utilization_threshold:
+                # Under-utilizing: increase pressure to use more
+                self.log_lambda.add_(cfg.lambda_increase_rate)
+            elif utilization > 1.0:
+                # Over budget: let the strong over_penalty handle it
+                pass
+            else:
+                # Good utilization: slowly relax
+                if self.log_lambda.exp() > cfg.lambda_min:
+                    self.log_lambda.sub_(cfg.lambda_decrease_rate)
         
         # Total loss
         total_loss = (
             pg_loss 
             - entropy_weight * entropy_bonus 
-            + log_barrier
+            + budget_penalty
         )
         
         # Metrics
@@ -632,10 +635,11 @@ class PolicyCompressor(nn.Module):
         metrics = {
             'policy/pg_loss': pg_loss.item(),
             'policy/entropy_bonus': entropy_bonus.item(),
-            'policy/log_barrier': log_barrier.item(),
+            'policy/budget_penalty': budget_penalty.item(),
+            'policy/over_penalty': over_penalty.item(),
+            'policy/under_penalty': under_penalty.item(),
             'policy/barrier_strength': λ.item(),
             'policy/expected_context': expected_total.item(),
-            'policy/budget_slack': slack.item() if torch.is_tensor(slack) else slack,
             'policy/total_loss': total_loss.item(),
             'policy/mean_reward': rewards.mean().item(),
             'policy/mean_chunks': mean_chunks,
