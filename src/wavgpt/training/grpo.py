@@ -509,8 +509,20 @@ class GRPOTrainer:
         }
     
     def save_checkpoint(self, filename: str):
-        """Save training checkpoint."""
+        """Save training checkpoint, keeping only the latest step checkpoint."""
         path = self.save_dir / filename
+        
+        # Delete old step checkpoints (keep only latest)
+        if filename.startswith("checkpoint_"):
+            import glob
+            old_checkpoints = glob.glob(str(self.save_dir / "checkpoint_*.pt"))
+            for old_ckpt in old_checkpoints:
+                if old_ckpt != str(path):
+                    try:
+                        Path(old_ckpt).unlink()
+                        logger.debug("deleted_old_checkpoint", path=old_ckpt)
+                    except OSError:
+                        pass
         
         checkpoint = {
             "global_step": self.global_step,
