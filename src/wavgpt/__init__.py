@@ -1,71 +1,35 @@
-"""Context Extension via Learned Chunking with GRPO.
+"""CHUNKY: Contextual Hierarchical Understanding via Neural K-boundarYing.
 
-This package extends pretrained transformer context windows by learning
-chunk boundaries via Group Relative Policy Optimization (GRPO).
-
-UNIFIED ARCHITECTURE:
-    - PolicyCompressor: Single network with shared SSM backbone
-      - Policy heads: boundary + keep decisions
-      - Compression head: chunk embeddings + difficulty scores
-    - ContextExtender: Main model wrapping pretrained transformer
-    - GRPOTrainer: Training loop for GRPO-based learning
+A differentiable SSM-based compressor for frozen-transformer KV caches.
 """
 
-__version__ = "5.0.0"
-
-import torch
-
-# Determine device
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+__version__ = "6.0.0"
 
 from wavgpt.models import (
-    # Configuration
-    ContextExtenderConfig,
+    CompressorConfig,
     TrainingConfig,
-    # SSM components
     SelectiveSSM,
     SSMLayer,
     SSMBackbone,
-    # Policy-Compressor (unified)
-    PolicyCompressor,
-    PolicyCompressorWithProjection,
-    PolicySample,
-    PolicyOutput,
-    # Injector
-    ChunkInjector,
-    # Main model
-    ContextExtender,
-    ContextExtenderOutput,
+    KVCompressor,
+    CompressorOutput,
+    KVExtender,
+    KVExtenderOutput,
 )
-
-from wavgpt.training import (
-    GRPOTrainer,
-    create_grpo_trainer,
-)
+from wavgpt.training import CompressorTrainer, create_trainer, split_prefix_continuation
 
 __all__ = [
-    # Version
     "__version__",
-    # Device
-    "DEVICE",
-    # Configuration
-    "ContextExtenderConfig",
+    "CompressorConfig",
     "TrainingConfig",
-    # SSM components
     "SelectiveSSM",
     "SSMLayer",
     "SSMBackbone",
-    # Policy-Compressor (unified)
-    "PolicyCompressor",
-    "PolicyCompressorWithProjection",
-    "PolicySample",
-    "PolicyOutput",
-    # Injector
-    "ChunkInjector",
-    # Main model
-    "ContextExtender",
-    "ContextExtenderOutput",
-    # Training
-    "GRPOTrainer",
-    "create_grpo_trainer",
+    "KVCompressor",
+    "CompressorOutput",
+    "KVExtender",
+    "KVExtenderOutput",
+    "CompressorTrainer",
+    "create_trainer",
+    "split_prefix_continuation",
 ]

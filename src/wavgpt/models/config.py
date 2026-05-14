@@ -1,17 +1,4 @@
-"""Configuration for Context Extension via Learned Chunking.
-
-This module provides configuration for fine-tuning pretrained transformers
-with learned chunk boundaries via GRPO (Group Relative Policy Optimization).
-
-KEY CONSTRAINT: num_chunks + num_unchunked_tokens <= max_context
-
-The policy learns TWO decisions per token:
-    1. boundary_prob: Should we end a chunk here?
-    2. keep_prob: Should this token be kept at full fidelity (for retrieval)?
-
-UNIFIED ARCHITECTURE: Policy and Compressor share the same SSM backbone,
-enabling end-to-end credit assignment via difficulty scores.
-"""
+"""Configuration dataclasses."""
 
 from __future__ import annotations
 
@@ -20,133 +7,65 @@ from typing import Optional
 
 
 @dataclass
-class ContextExtenderConfig:
-    """
-    Configuration for Context Extension with Unified Policy-Compressor.
-    
-    Architecture:
-        - Pretrained transformer (frozen or fine-tuned with KL penalty)
-        - UNIFIED SSM backbone for policy + compression (shared representations)
-        - Policy heads: boundary + keep decisions
-        - Compression head: chunk embeddings + difficulty scores
-    
-    KEY INSIGHT: Sharing the SSM backbone enables credit assignment.
-    Difficulty scores tell the policy which boundary placements make
-    compression hard vs easy, providing direct gradient signal.
-    """
-    
-    # Pretrained model settings
+class CompressorConfig:
     pretrained_model_name: str = "gpt2"
-    hidden_size: int = 768  # Overridden by pretrained model
-    freeze_pretrained: bool = False
-    kl_penalty_weight: float = 0.1
-    
-    # Context constraint: chunks + kept tokens must fit
-    max_context: int = 1024
-    
-    @property
-    def max_chunks(self) -> int:
-        return self.max_context
-    
-    # Chunk/policy dimension (shared by policy and compression)
-    chunk_dim: int = 256
-    
-    # SSM backbone settings (SHARED between policy and compression)
+    hidden_size: int = 768  # overridden from pretrained config
+
+    # Compressed cache size (K_slots in the math).
+    max_kv_slots: int = 128
+
+    # SSM scoring backbone.
+    compress_dim: int = 256
     ssm_d_state: int = 64
     ssm_d_conv: int = 4
     ssm_expand: int = 2
     n_ssm_layers: int = 4
-    
-    # Policy settings
-    policy_hidden_dim: int = 256
-    initial_boundary_bias: float = -2.0  # ~12% boundary probability
-    initial_keep_bias: float = -1.0      # ~27% keep probability
-    
-    # Entropy bonus (prevents policy collapse)
-    entropy_bonus_weight: float = 0.05
-    
-    # Budget utilization constraint
-    # Target utilization as fraction of max_context (e.g., 0.95 = 95%)
-    target_utilization_ratio: float = 0.95
-    # Penalty strength for exceeding max_context (should be ~1-10x LM loss scale)
-    over_budget_penalty: float = 10.0
-    # Penalty strength for under-utilizing budget
-    under_budget_penalty: float = 1.0
-    # Barrier strength bounds (Lagrangian multiplier)
-    lambda_min: float = 0.1
-    lambda_max: float = 10.0
-    # Dual update rates for barrier strength
-    lambda_increase_rate: float = 0.01
-    lambda_decrease_rate: float = 0.005
-    # Utilization threshold for adjusting barrier
-    low_utilization_threshold: float = 0.8
-    
-    # Initial threshold biases
-    initial_keep_threshold_bias: float = 1.0
-    
-    # Temperature bounds (prevents numerical instability)
-    temperature_min: float = 0.1
-    temperature_max: float = 10.0
-    
-    # Position encoding scale (higher = more frequency variation)
-    position_scale: float = 1000.0
-    
-    # Numerical stability clamps
-    advantage_clamp: float = 10.0
-    log_ratio_clamp: float = 10.0
-    
-    # GRPO settings
-    grpo_num_samples: int = 4
-    grpo_temperature: float = 1.0
-    grpo_kl_coef: float = 0.01
-    grpo_clip_range: float = 0.2
-    
-    # Loss scaling
-    policy_loss_scale: float = 1000.0
-    
-    # Training settings
+
+    importance_temp_min: float = 0.1
+    importance_temp_max: float = 10.0
+
+    # Auxiliary loss weights.
+    coverage_loss_weight: float = 0.0   # encourage slot diversity
+    sparsity_loss_weight: float = 0.0   # encourage peaked mixing
+
     dropout: float = 0.1
     gradient_checkpointing: bool = True
 
     def __post_init__(self):
-        """Validate configuration."""
-        assert self.max_context > 0, "max_context must be positive"
-        assert self.grpo_num_samples >= 2, "GRPO needs at least 2 samples for variance"
+        if self.max_kv_slots <= 0:
+            raise ValueError("max_kv_slots must be positive")
+        if self.compress_dim % 2 != 0:
+            raise ValueError("compress_dim must be even for sinusoidal pos enc compatibility")
 
 
-@dataclass  
+@dataclass
 class TrainingConfig:
-    """Training configuration for GRPO-based context extension."""
-    
-    # Optimization
-    learning_rate: float = 5e-5
-    policy_lr: float = 1e-5
+    learning_rate: float = 1e-4
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     warmup_steps: int = 100
-    
-    # Batch settings
+
     batch_size: int = 4
-    gradient_accumulation_steps: int = 8
+    gradient_accumulation_steps: int = 4
     effective_batch_size: int = field(init=False)
-    
-    # Sequence settings
-    max_seq_length: int = 4096
-    
-    # Training duration
+
+    # Training sequence is split into prefix (compressed) + continuation (loss target).
+    max_seq_length: int = 1024
+    min_continuation_length: int = 64
+    max_continuation_length: int = 256
+
+    # Gumbel-noise on importance for exploration during training.
+    use_gumbel_noise: bool = True
+
     num_epochs: int = 3
     max_steps: Optional[int] = None
-    
-    # Logging and saving
+
     log_interval: int = 10
     save_interval: int = 500
     eval_interval: int = 100
-    
-    # Mixed precision
+
     use_amp: bool = True
-    
-    # Device
     device: str = "cuda"
-    
+
     def __post_init__(self):
         self.effective_batch_size = self.batch_size * self.gradient_accumulation_steps
