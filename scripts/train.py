@@ -55,6 +55,29 @@ class FixedTextDataset(Dataset):
         return {"input_ids": torch.tensor(toks, dtype=torch.long)}
 
 
+class OverfitDataset(Dataset):
+    """One fixed sample, repeated `length` times. Used by --overfit-batch to
+    verify the training loop can actually drive loss down on a controlled input.
+    Random-batch training loss is inherently noisy; this is the right unit test."""
+
+    def __init__(self, tokenizer, text: str, max_seq_length: int, length: int = 10_000):
+        toks = tokenizer.encode(text, add_special_tokens=False)
+        if len(toks) < max_seq_length:
+            # Tile to fill.
+            reps = (max_seq_length // len(toks)) + 1
+            toks = (toks * reps)[:max_seq_length]
+        else:
+            toks = toks[:max_seq_length]
+        self._sample = torch.tensor(toks, dtype=torch.long)
+        self._length = length
+
+    def __len__(self):
+        return self._length
+
+    def __getitem__(self, idx):
+        return {"input_ids": self._sample.clone()}
+
+
 class PG19Dataset(Dataset):
     """Streaming windows from PG19. Fixed length per window."""
 
@@ -117,8 +140,19 @@ def parse_args():
     p.add_argument("--stride", type=int, default=512)
     p.add_argument("--coverage-weight", type=float, default=0.0)
     p.add_argument("--sparsity-weight", type=float, default=0.0)
+    p.add_argument("--dropout", type=float, default=0.1,
+                   help="Compressor dropout (set 0 for deterministic forward).")
     p.add_argument("--no-gumbel", action="store_true")
     p.add_argument("--unfreeze-lm", action="store_true")
+    p.add_argument("--overfit-batch", action="store_true",
+                   help="Train repeatedly on a single fixed sample. Use for "
+                        "smoke-tests: loss MUST descend smoothly here or training is broken.")
+    p.add_argument("--fixed-eval-batch", action="store_true",
+                   help="Snapshot the first training batch and log eval PPL on it "
+                        "every --eval-interval steps (clean training-curve signal).")
+    p.add_argument("--eval-interval", type=int, default=10)
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Stop after N optimizer steps (overrides epochs).")
     p.add_argument("--log-interval", type=int, default=10)
     p.add_argument("--save-dir", type=str, default="checkpoints")
     p.add_argument("--no-wandb", action="store_true")
@@ -149,6 +183,7 @@ def main():
         n_ssm_layers=args.n_ssm_layers,
         coverage_loss_weight=args.coverage_weight,
         sparsity_loss_weight=args.sparsity_weight,
+        dropout=args.dropout,
     )
     train_config = TrainingConfig(
         learning_rate=args.lr,
@@ -159,7 +194,9 @@ def main():
         min_continuation_length=args.min_continuation,
         max_continuation_length=args.max_continuation,
         use_gumbel_noise=not args.no_gumbel,
+        max_steps=args.max_steps,
         log_interval=args.log_interval,
+        eval_interval=args.eval_interval,
         use_amp=not args.no_amp,
         device=device,
     )
@@ -169,7 +206,18 @@ def main():
     )
     logger.info("model_created", trainable_params=model.get_trainable_params())
 
-    if args.debug:
+    if args.overfit_batch:
+        text = (
+            "The history of artificial intelligence began in antiquity with myths and "
+            "stories of artificial beings endowed with intelligence by master craftsmen. "
+            "The seeds of modern AI were planted by philosophers describing thinking as "
+            "mechanical symbol manipulation, culminating in the programmable digital "
+            "computer of the 1940s. Alan Turing proposed the imitation game as a test of "
+            "machine intelligence in 1950. John McCarthy organised the Dartmouth workshop "
+            "in 1956, coining the term artificial intelligence and launching the field."
+        )
+        dataset = OverfitDataset(tokenizer, text, max_seq_length=args.max_seq_length)
+    elif args.debug:
         texts = [
             "The quick brown fox jumps over the lazy dog. " * 400,
             "In machine learning neural networks learn representations. " * 400,
@@ -196,6 +244,14 @@ def main():
         model=model, train_config=train_config, model_config=model_config,
         use_wandb=use_wandb, save_dir=args.save_dir,
     )
+
+    if args.fixed_eval_batch:
+        first_batch = next(iter(train_loader))
+        trainer.set_fixed_eval_batch(first_batch)
+        logger.info("fixed_eval_batch_set",
+                    shape=tuple(first_batch["input_ids"].shape),
+                    eval_interval=args.eval_interval)
+
     trainer.train(train_loader=train_loader, num_epochs=args.epochs)
 
     if use_wandb:

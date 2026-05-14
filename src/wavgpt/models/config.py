@@ -24,6 +24,11 @@ class CompressorConfig:
     importance_temp_min: float = 0.1
     importance_temp_max: float = 10.0
 
+    # Initialization knobs (default to "useful starting point").
+    init_slot_queries_orthogonal: bool = True
+    initial_importance_temperature: float = 0.5
+    initial_importance_bias: float = 0.1
+
     # Auxiliary loss weights.
     coverage_loss_weight: float = 0.0   # encourage slot diversity
     sparsity_loss_weight: float = 0.0   # encourage peaked mixing

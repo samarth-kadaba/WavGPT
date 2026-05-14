@@ -19,6 +19,13 @@ from wavgpt.models.config import CompressorConfig
 from wavgpt.models.ssm import SSMBackbone
 
 
+def _orthogonal_init(shape: Tuple[int, ...], gain: float = 1.0) -> torch.Tensor:
+    """Orthogonal init for an arbitrary 2D parameter."""
+    t = torch.empty(*shape)
+    nn.init.orthogonal_(t, gain=gain)
+    return t
+
+
 class CompressorOutput(NamedTuple):
     K_out: torch.Tensor              # (B, n_layers, n_heads, K_slots, head_dim)
     V_out: torch.Tensor              # (B, n_layers, n_heads, K_slots, head_dim)
@@ -53,7 +60,15 @@ class KVCompressor(nn.Module):
         )
 
         # Per-slot learned queries.
-        self.slot_queries = nn.Parameter(torch.randn(self.K_slots, config.compress_dim) * 0.02)
+        if config.init_slot_queries_orthogonal and self.K_slots <= config.compress_dim:
+            # Orthogonal across slots: every pair of queries starts maximally distinct.
+            self.slot_queries = nn.Parameter(
+                _orthogonal_init((self.K_slots, config.compress_dim), gain=1.0)
+            )
+        else:
+            self.slot_queries = nn.Parameter(
+                torch.randn(self.K_slots, config.compress_dim) * 0.02
+            )
 
         # Cross-attention projections (kept low-dim in compress_dim space).
         self.q_proj = nn.Linear(config.compress_dim, config.compress_dim, bias=False)
@@ -64,8 +79,14 @@ class KVCompressor(nn.Module):
             nn.GELU(),
             nn.Linear(config.compress_dim, 1),
         )
+        # Slight positive bias so the importance signal is non-trivial at step 0.
+        with torch.no_grad():
+            self.importance_head[-1].bias.fill_(config.initial_importance_bias)
 
-        self.log_importance_temp = nn.Parameter(torch.tensor(0.0))
+        # Lower-than-1 initial temperature so the importance term has leverage.
+        self.log_importance_temp = nn.Parameter(
+            torch.tensor(math.log(max(config.initial_importance_temperature, 1e-3)))
+        )
 
     @property
     def importance_temperature(self) -> torch.Tensor:

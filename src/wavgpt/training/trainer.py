@@ -92,6 +92,53 @@ class CompressorTrainer:
         self.global_step = 0
         self.best_loss = float("inf")
 
+        # Optional fixed batch for periodic eval-on-the-same-input PPL logging.
+        # Set via :meth:`set_fixed_eval_batch`.
+        self._fixed_eval_batch: Optional[Dict[str, torch.Tensor]] = None
+
+    def set_fixed_eval_batch(self, batch: Dict[str, torch.Tensor]) -> None:
+        """Snapshot a batch (input_ids, optional attention_mask) for periodic
+        clean eval-PPL logging. Stored on `self.device`."""
+        snap = {"input_ids": batch["input_ids"].to(self.device).clone()}
+        if batch.get("attention_mask") is not None:
+            snap["attention_mask"] = batch["attention_mask"].to(self.device).clone()
+        self._fixed_eval_batch = snap
+
+    @torch.no_grad()
+    def evaluate_fixed_batch(self) -> Optional[Dict[str, float]]:
+        """Deterministic forward on the stashed fixed batch using
+        `min_continuation_length` as the continuation length."""
+        if self._fixed_eval_batch is None:
+            return None
+        input_ids = self._fixed_eval_batch["input_ids"]
+        attn = self._fixed_eval_batch.get("attention_mask")
+
+        cont_len = self.train_config.min_continuation_length
+        if attn is not None:
+            eff_T = int(attn.sum(dim=1).min().item())
+        else:
+            eff_T = input_ids.size(1)
+        eff_T = max(eff_T, cont_len + 8)
+        prefix_len = eff_T - cont_len
+
+        was_training = self.model.training
+        self.model.eval()
+        out = self.model.forward(
+            prefix_ids=input_ids[:, :prefix_len],
+            continuation_ids=input_ids[:, prefix_len:prefix_len + cont_len],
+            prefix_attention_mask=attn[:, :prefix_len] if attn is not None else None,
+            gumbel_noise=False,
+            return_aux=False,
+        )
+        if was_training:
+            self.model.train()
+        return {
+            "eval/lm_loss": float(out.lm_loss),
+            "eval/perplexity": float(torch.exp(out.lm_loss)),
+            "eval/prefix_length": prefix_len,
+            "eval/continuation_length": cont_len,
+        }
+
     def _create_optimizer(self) -> torch.optim.Optimizer:
         groups = [{
             "params": [p for p in self.model.compressor.parameters() if p.requires_grad],
@@ -252,6 +299,15 @@ class CompressorTrainer:
                     if self.use_wandb:
                         wandb.log(avg, step=self.global_step)
                     accumulated = {}
+
+                if (self._fixed_eval_batch is not None
+                        and self.global_step > 0
+                        and self.global_step % self.train_config.eval_interval == 0):
+                    eval_metrics = self.evaluate_fixed_batch()
+                    if eval_metrics is not None:
+                        logger.info("fixed_eval", step=self.global_step, **eval_metrics)
+                        if self.use_wandb:
+                            wandb.log(eval_metrics, step=self.global_step)
 
                 if (self.global_step > 0
                         and self.global_step % self.train_config.save_interval == 0):

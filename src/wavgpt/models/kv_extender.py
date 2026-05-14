@@ -91,8 +91,18 @@ class KVExtender(nn.Module):
         if freeze_pretrained:
             for p in self.pretrained.parameters():
                 p.requires_grad = False
+            self.pretrained.eval()
 
         self.compressor = KVCompressor(config, pretrained_dim)
+
+    def train(self, mode: bool = True):
+        """Override: keep the frozen pretrained LM in eval mode (no dropout, no
+        train-mode side effects) regardless of the wrapper's mode. The frozen
+        LM must produce deterministic outputs for the same input."""
+        super().train(mode)
+        if self.freeze_pretrained:
+            self.pretrained.eval()
+        return self
 
     @classmethod
     def from_pretrained(
