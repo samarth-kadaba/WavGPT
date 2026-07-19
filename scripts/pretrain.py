@@ -15,7 +15,7 @@ from chunky.pretrain import TrainConfig, train  # noqa: E402
 
 def main() -> None:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--variant", choices=["standard", "ours"], default="standard")
+    p.add_argument("--variant", choices=["standard", "window", "ours"], default="standard")
     p.add_argument("--scale", default="xs")
     p.add_argument("--dataset", default="fineweb-edu")
     p.add_argument("--seq-len", type=int, default=4096)

@@ -10,7 +10,10 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
+
+POS_BINS = [(0, 512), (512, 1024), (1024, 2048), (2048, 1 << 30)]
 
 from chunky.compressor import CompressorConfig
 from chunky.data import (
@@ -47,6 +50,7 @@ class TrainConfig:
     ckpt_every: int = 2000
     out_dir: str = "checkpoints"
     wandb_project: str = "chunky"
+    run_tag: str = "v2"
     seed: int = 0
     grad_accum: int = field(init=False)
 
@@ -56,7 +60,7 @@ class TrainConfig:
 
 def build_model(cfg: TrainConfig) -> Transformer:
     model_cfg = SCALES[cfg.scale]
-    if cfg.variant == "standard":
+    if cfg.variant in ("standard", "window"):
         return Transformer(model_cfg)
     comp = CompressorConfig(d_model=model_cfg.d_model, n_heads=model_cfg.n_heads, max_slots=cfg.budget)
     return CompressedTransformer(model_cfg, comp, chunk_size=cfg.chunk_size)
@@ -98,22 +102,43 @@ def load_ckpt(path: Path):
     return torch.load(path, map_location="cpu", weights_only=False) if path.exists() else None
 
 
+def within_doc_offset(seg_ids: torch.Tensor) -> torch.Tensor:
+    """Same-document context length available at each position (tokens since doc start)."""
+    B, T = seg_ids.shape
+    idx = torch.arange(T, device=seg_ids.device).expand(B, T)
+    is_start = torch.ones_like(seg_ids, dtype=torch.bool)
+    is_start[:, 1:] = seg_ids[:, 1:] != seg_ids[:, :-1]
+    start = torch.cummax(torch.where(is_start, idx, torch.zeros_like(idx)), dim=1).values
+    return idx - start
+
+
 @torch.no_grad()
-def evaluate(model, val, cfg, device, eos_id, use_doc_mask) -> float:
+def evaluate(model, val, cfg, device, eos_id, attn_mask):
+    """Returns (overall_loss, {bin: loss}) with loss binned by same-doc context length."""
     model.eval()
-    total, n = 0.0, 0
+    bin_sum = [0.0] * len(POS_BINS)
+    bin_cnt = [0] * len(POS_BINS)
     for start in range(0, min(len(val), cfg.val_batches * cfg.micro_batch), cfg.micro_batch):
         batch = val[start:start + cfg.micro_batch]
         input_ids = torch.stack([b["input_ids"] for b in batch]).to(device)
         seg_ids = torch.stack([b["seg_ids"] for b in batch]).to(device)
         labels = masked_labels(input_ids, eos_id)
-        attn_mask = cross_doc_attn_mask(seg_ids) if use_doc_mask else None
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
-            _, loss = model(input_ids, attn_mask=attn_mask, labels=labels)
-        total += loss.item()
-        n += 1
+            logits, _ = model(input_ids, attn_mask=attn_mask)
+        tok_loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, logits.size(-1)).float(),
+            labels[:, 1:].reshape(-1), ignore_index=-100, reduction="none",
+        )
+        offset = within_doc_offset(seg_ids)[:, :-1].reshape(-1)
+        valid = labels[:, 1:].reshape(-1) != -100
+        for k, (lo, hi) in enumerate(POS_BINS):
+            m = valid & (offset >= lo) & (offset < hi)
+            bin_sum[k] += float(tok_loss[m].sum())
+            bin_cnt[k] += int(m.sum())
     model.train()
-    return total / max(n, 1)
+    bins = {f"{lo}_{hi}": bin_sum[k] / bin_cnt[k] for k, (lo, hi) in enumerate(POS_BINS) if bin_cnt[k]}
+    overall = sum(bin_sum) / max(sum(bin_cnt), 1)
+    return overall, bins
 
 
 def train(cfg: TrainConfig, tokenizer, log=print) -> None:
@@ -131,12 +156,13 @@ def train(cfg: TrainConfig, tokenizer, log=print) -> None:
     opt = make_optimizer(model, cfg)
     total_steps = cfg.total_tokens // cfg.global_batch_tokens
     eos_id = tokenizer.eos_token_id
-    use_doc_mask = cfg.variant == "standard"
     corpus = CORPORA[cfg.dataset]
+    # window: sliding-window attention capped at the same budget as ours; else full/streaming.
+    attn_mask = sliding_window_mask(cfg.seq_len, cfg.budget, device) if cfg.variant == "window" else None
 
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    latest = out_dir / f"{cfg.variant}_{cfg.scale}_latest.pt"
+    latest = out_dir / f"{cfg.variant}_{cfg.scale}_{cfg.run_tag}_latest.pt"
 
     ckpt = load_ckpt(latest)
     start_step, docs_prev = 0, 0
@@ -160,8 +186,9 @@ def train(cfg: TrainConfig, tokenizer, log=print) -> None:
         log(f"model={cfg.variant}/{cfg.scale} params={model.num_params():,} steps={total_steps} val_windows={len(val)}")
         try:
             import wandb
-            run = wandb.init(project=cfg.wandb_project, name=f"{cfg.variant}-{cfg.scale}",
-                             config=vars(cfg), resume="allow", id=f"{cfg.variant}-{cfg.scale}")
+            name = f"{cfg.variant}-{cfg.scale}-{cfg.run_tag}"
+            run = wandb.init(project=cfg.wandb_project, name=name, config=vars(cfg),
+                             resume="allow", id=name)
         except Exception as e:
             log(f"wandb disabled: {e}")
 
@@ -174,7 +201,6 @@ def train(cfg: TrainConfig, tokenizer, log=print) -> None:
             batch = next(batches)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             labels = masked_labels(input_ids, eos_id)
-            attn_mask = cross_doc_attn_mask(batch["seg_ids"].to(device)) if use_doc_mask else None
             sync = (micro == cfg.grad_accum - 1) or not ddp
             with (engine.no_sync() if (ddp and not sync) else nullcontext()):
                 with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device != "cpu"):
@@ -194,10 +220,15 @@ def train(cfg: TrainConfig, tokenizer, log=print) -> None:
                 run.log({"train/loss": loss_sum, "train/ppl": math.exp(min(loss_sum, 20)), "lr": lr}, step=step)
 
         if rank == 0 and step > 0 and step % cfg.val_every == 0:
-            val_loss = evaluate(model, val, cfg, device, eos_id, use_doc_mask)
-            log(f"  val loss={val_loss:.4f} ppl={math.exp(min(val_loss, 20)):.2f}")
+            val_loss, bins = evaluate(model, val, cfg, device, eos_id, attn_mask)
+            log(f"  val loss={val_loss:.4f} ppl={math.exp(min(val_loss, 20)):.2f} "
+                + " ".join(f"[{b}]={v:.3f}" for b, v in bins.items()))
             if run:
-                run.log({"val/loss": val_loss, "val/ppl": math.exp(min(val_loss, 20))}, step=step)
+                metrics = {"val/loss": val_loss, "val/ppl": math.exp(min(val_loss, 20))}
+                for b, v in bins.items():
+                    metrics[f"val/loss_ctx_{b}"] = v
+                    metrics[f"val/ppl_ctx_{b}"] = math.exp(min(v, 20))
+                run.log(metrics, step=step)
 
         if rank == 0 and step > 0 and step % cfg.ckpt_every == 0:
             docs_trained = docs_prev + world * dataset.docs_consumed

@@ -36,6 +36,34 @@ def prepare_data() -> None:
     print("data ready at", DATA_DIR)
 
 
+@app.function(volumes={"/data": data_volume}, timeout=600)
+def data_stats() -> None:
+    import glob
+
+    import numpy as np
+    import pyarrow.parquet as pq
+
+    files = sorted(glob.glob("/data/fineweb-edu/**/*.parquet", recursive=True))
+    lens = []
+    for f in files:
+        schema = pq.read_schema(f)
+        if "token_count" in schema.names:
+            lens.append(pq.read_table(f, columns=["token_count"]).column("token_count").to_numpy())
+        else:  # fall back to a char/4 estimate
+            txt = pq.read_table(f, columns=["text"]).column("text").to_pylist()
+            lens.append(np.array([len(t) // 4 for t in txt]))
+    L = np.concatenate(lens).astype(np.int64)
+    total = int(L.sum())
+    print(f"docs={len(L):,} tokens={total:,} mean={L.mean():.0f} "
+          f"median={np.median(L):.0f} p90={np.percentile(L, 90):.0f} "
+          f"p99={np.percentile(L, 99):.0f} max={L.max():,}")
+    for t in (512, 1024, 2048, 4096):
+        frac_docs = float((L > t).mean())
+        beyond = float(np.maximum(0, L - t).sum()) / total
+        print(f"  >{t:>4} tok: docs={frac_docs * 100:5.1f}%   "
+              f"predictions-with-that-much-same-doc-context={beyond * 100:5.1f}%")
+
+
 @app.function(gpu="A10G", timeout=900)
 def smoke() -> None:
     import sys
@@ -175,12 +203,12 @@ def train(variant: str = "standard", scale: str = "xs",
 
 
 @app.local_entrypoint()
-def main(variant: str = "both") -> None:
+def main(variant: str = "all") -> None:
     """Spawn training async so it runs to completion in the cloud.
 
-    Launch with: modal run --detach modal_app.py --variant both
+    Launch with: modal run --detach modal_app.py --variant all
     """
-    variants = ["standard", "ours"] if variant == "both" else [variant]
+    variants = ["standard", "window", "ours"] if variant == "all" else [variant]
     for v in variants:
         handle = train.spawn(variant=v)
         print(f"spawned {v}: {handle.object_id}")
