@@ -172,3 +172,15 @@ def train(variant: str = "standard", scale: str = "xs",
     volume.commit()
     if proc.returncode != 0:
         raise RuntimeError(f"training exited with code {proc.returncode}")
+
+
+@app.local_entrypoint()
+def main(variant: str = "both") -> None:
+    """Spawn training async so it runs to completion in the cloud.
+
+    Launch with: modal run --detach modal_app.py --variant both
+    """
+    variants = ["standard", "ours"] if variant == "both" else [variant]
+    for v in variants:
+        handle = train.spawn(variant=v)
+        print(f"spawned {v}: {handle.object_id}")
