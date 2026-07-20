@@ -144,13 +144,13 @@ def held_out_val(tokenizer, corpus: Corpus, seq_length: int, n_docs: int):
     return [{"input_ids": i, "seg_ids": s} for i, s in zip(ids, segs)]
 
 
-def cross_doc_attn_mask(seg_ids: torch.Tensor) -> torch.Tensor:
-    """Additive mask (B, 1, T, T): 0 where a query may attend (same doc, causal), else -inf."""
-    B, T = seg_ids.shape
-    same = seg_ids[:, :, None] == seg_ids[:, None, :]
-    causal = torch.ones(T, T, dtype=torch.bool, device=seg_ids.device).tril()
-    mask = torch.zeros(B, 1, T, T, device=seg_ids.device)
-    return mask.masked_fill(~(same & causal).unsqueeze(1), float("-inf"))
+def sliding_window_mask(seq_len: int, window: int, device) -> torch.Tensor:
+    """Additive causal mask (1, 1, T, T) restricting each query to the last `window` keys."""
+    i = torch.arange(seq_len, device=device)[:, None]
+    j = torch.arange(seq_len, device=device)[None, :]
+    keep = (j <= i) & (i - j < window)
+    mask = torch.zeros(seq_len, seq_len, device=device)
+    return mask.masked_fill(~keep, float("-inf")).view(1, 1, seq_len, seq_len)
 
 
 def masked_labels(input_ids: torch.Tensor, eos_id: int) -> torch.Tensor:

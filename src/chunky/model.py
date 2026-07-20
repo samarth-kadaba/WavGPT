@@ -17,7 +17,7 @@ class ModelConfig:
     d_model: int = 768
     n_heads: int = 12
     ffn_mult: float = 3.0
-    max_seq_len: int = 4096
+    max_seq_len: int = 16384  # RoPE cache; training uses seq_len, val extrapolates beyond
     rope_theta: float = 10_000.0
     norm_eps: float = 1e-5
     tie_embeddings: bool = True

@@ -19,9 +19,9 @@ from chunky.compressor import CompressorConfig
 from chunky.data import (
     CORPORA,
     StreamingPacked,
-    cross_doc_attn_mask,
     held_out_val,
     masked_labels,
+    sliding_window_mask,
 )
 from chunky.model import SCALES, Transformer
 from chunky.streaming import CompressedTransformer
@@ -46,6 +46,7 @@ class TrainConfig:
     val_docs: int = 500
     val_every: int = 500
     val_batches: int = 20
+    val_lengths: tuple = (4096, 8192, 16384)
     log_every: int = 20
     ckpt_every: int = 2000
     out_dir: str = "checkpoints"
@@ -113,13 +114,13 @@ def within_doc_offset(seg_ids: torch.Tensor) -> torch.Tensor:
 
 
 @torch.no_grad()
-def evaluate(model, val, cfg, device, eos_id, attn_mask):
+def evaluate(model, val, device, eos_id, attn_mask, batch_size, max_batches):
     """Returns (overall_loss, {bin: loss}) with loss binned by same-doc context length."""
     model.eval()
     bin_sum = [0.0] * len(POS_BINS)
     bin_cnt = [0] * len(POS_BINS)
-    for start in range(0, min(len(val), cfg.val_batches * cfg.micro_batch), cfg.micro_batch):
-        batch = val[start:start + cfg.micro_batch]
+    for start in range(0, min(len(val), max_batches * batch_size), batch_size):
+        batch = val[start:start + batch_size]
         input_ids = torch.stack([b["input_ids"] for b in batch]).to(device)
         seg_ids = torch.stack([b["seg_ids"] for b in batch]).to(device)
         labels = masked_labels(input_ids, eos_id)
@@ -180,10 +181,11 @@ def train(cfg: TrainConfig, tokenizer, log=print) -> None:
     batches = iter(DataLoader(dataset, batch_size=cfg.micro_batch, num_workers=0, pin_memory=True))
 
     run = None
-    val = []
+    val_sets = {}
     if rank == 0:
-        val = held_out_val(tokenizer, corpus, cfg.seq_len, cfg.val_docs)
-        log(f"model={cfg.variant}/{cfg.scale} params={model.num_params():,} steps={total_steps} val_windows={len(val)}")
+        val_sets = {L: held_out_val(tokenizer, corpus, L, cfg.val_docs) for L in cfg.val_lengths}
+        log(f"model={cfg.variant}/{cfg.scale} params={model.num_params():,} steps={total_steps} "
+            f"val_lengths={cfg.val_lengths}")
         try:
             import wandb
             name = f"{cfg.variant}-{cfg.scale}-{cfg.run_tag}"
@@ -220,14 +222,18 @@ def train(cfg: TrainConfig, tokenizer, log=print) -> None:
                 run.log({"train/loss": loss_sum, "train/ppl": math.exp(min(loss_sum, 20)), "lr": lr}, step=step)
 
         if rank == 0 and step > 0 and step % cfg.val_every == 0:
-            val_loss, bins = evaluate(model, val, cfg, device, eos_id, attn_mask)
-            log(f"  val loss={val_loss:.4f} ppl={math.exp(min(val_loss, 20)):.2f} "
-                + " ".join(f"[{b}]={v:.3f}" for b, v in bins.items()))
-            if run:
-                metrics = {"val/loss": val_loss, "val/ppl": math.exp(min(val_loss, 20))}
+            metrics = {}
+            for L in cfg.val_lengths:
+                vbatch = cfg.micro_batch if L <= cfg.seq_len else 1  # long seqs are O(L^2) on standard/window
+                vmask = sliding_window_mask(L, cfg.budget, device) if cfg.variant == "window" else None
+                vloss, bins = evaluate(model, val_sets[L], device, eos_id, vmask, vbatch, cfg.val_batches)
+                log(f"  val@{L} loss={vloss:.4f} ppl={math.exp(min(vloss, 20)):.2f} "
+                    + " ".join(f"[{b}]={v:.3f}" for b, v in bins.items()))
+                metrics[f"val_{L}/loss"] = vloss
+                metrics[f"val_{L}/ppl"] = math.exp(min(vloss, 20))
                 for b, v in bins.items():
-                    metrics[f"val/loss_ctx_{b}"] = v
-                    metrics[f"val/ppl_ctx_{b}"] = math.exp(min(v, 20))
+                    metrics[f"val_{L}/ppl_ctx_{b}"] = math.exp(min(v, 20))
+            if run:
                 run.log(metrics, step=step)
 
         if rank == 0 and step > 0 and step % cfg.ckpt_every == 0:

@@ -72,12 +72,16 @@ def smoke() -> None:
 
     sys.path.insert(0, "/root/src")
     from chunky.compressor import CompressorConfig
+    from chunky.data import sliding_window_mask
     from chunky.model import ModelConfig, Transformer
+    from chunky.pretrain import evaluate
     from chunky.streaming import CompressedTransformer
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     cfg = ModelConfig(vocab_size=512, n_layers=2, d_model=64, n_heads=4, max_seq_len=64)
     ids = torch.randint(0, 512, (2, 32), device=dev)
+    val = [{"input_ids": torch.randint(0, 512, (32,)), "seg_ids": torch.zeros(32, dtype=torch.long)}
+           for _ in range(4)]
 
     variants = {
         "standard": Transformer(cfg),
@@ -88,7 +92,11 @@ def smoke() -> None:
         _, loss = model(ids, labels=ids)
         loss.backward()
         assert torch.isfinite(loss), f"{name}: non-finite loss"
-        print(f"{name}: loss={loss.item():.4f} params={model.num_params():,}  OK")
+        # exercise the multi-length eval + position-binning path
+        mask = sliding_window_mask(32, 16, dev) if name == "standard" else None
+        vloss, bins = evaluate(model, val, dev, 0, mask, batch_size=2, max_batches=2)
+        assert vloss == vloss, f"{name}: nan val"  # not nan
+        print(f"{name}: loss={loss.item():.4f} params={model.num_params():,} val={vloss:.3f} bins={list(bins)}  OK")
 
 
 @app.function(gpu="H100", timeout=1800)
@@ -102,7 +110,7 @@ def profile(seq_len: int = 4096, steps: int = 6, warmup: int = 2) -> None:
 
     sys.path.insert(0, "/root/src")
     from chunky.compressor import CompressorConfig
-    from chunky.data import cross_doc_attn_mask
+    from chunky.data import sliding_window_mask
     from chunky.model import SCALES, Transformer
     from chunky.streaming import CompressedTransformer
 
@@ -126,7 +134,7 @@ def profile(seq_len: int = 4096, steps: int = 6, warmup: int = 2) -> None:
         torch.cuda.reset_peak_memory_stats()
         if variant == "standard":
             model = Transformer(mcfg).to(dev)
-            mask = cross_doc_attn_mask(torch.zeros(mb, seq_len, dtype=torch.long, device=dev))
+            mask = sliding_window_mask(seq_len, 512, dev)
         else:
             comp = CompressorConfig(d_model=mcfg.d_model, n_heads=mcfg.n_heads, max_slots=512)
             model = CompressedTransformer(mcfg, comp, chunk_size=512).to(dev)
@@ -174,7 +182,7 @@ def profile(seq_len: int = 4096, steps: int = 6, warmup: int = 2) -> None:
                 raise
 
 
-@app.function(gpu="H100:2", timeout=24 * 3600,
+@app.function(gpu="H100", timeout=24 * 3600,
               volumes={"/ckpt": volume, "/data": data_volume},
               secrets=[modal.Secret.from_name("wandb")], retries=3)
 def train(variant: str = "standard", scale: str = "xs",
@@ -187,7 +195,7 @@ def train(variant: str = "standard", scale: str = "xs",
     volume.reload()  # pick up checkpoints from a previous (preempted) attempt
     data_volume.reload()
     proc = subprocess.Popen(
-        [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2",
+        [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=1",
          "/root/scripts/pretrain.py",
          "--variant", variant, "--scale", scale,
          "--total-tokens", str(total_tokens), "--micro-batch", str(micro_batch),
