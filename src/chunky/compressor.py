@@ -44,17 +44,19 @@ class KVCompressor(nn.Module):
         self.importance = nn.Sequential(nn.Linear(cfg.d_model, c), nn.GELU(), nn.Linear(c, 1))
         self.log_temp = nn.Parameter(torch.tensor(math.log(cfg.importance_temp)))
 
-    def mixing_weights(self, candidates, active_mask=None):
+    def mixing_weights(self, candidates, active_mask=None, cand_mask=None):
         c = self.cfg.compress_dim
         q = self.q_proj(self.slots)
         k = self.k_proj(candidates)
         s = self.importance(candidates).squeeze(-1)
         logits = torch.einsum("mc,bnc->bmn", q, k) / math.sqrt(c) + (s / self.log_temp.exp()).unsqueeze(1)
+        if cand_mask is not None:  # exclude invalid (zero-padded) candidates from the mix
+            logits = logits.masked_fill(~cand_mask.view(cand_mask.size(0), 1, -1), float("-inf"))
         A = F.softmax(logits, dim=-1)
         if active_mask is not None:
             A = A * active_mask.to(A.dtype).view(1, -1, 1)
         return A
 
-    def forward(self, K, V, active_mask: Optional[torch.Tensor] = None):
-        A = self.mixing_weights(fold_heads(K), active_mask).unsqueeze(1)
+    def forward(self, K, V, active_mask: Optional[torch.Tensor] = None, cand_mask: Optional[torch.Tensor] = None):
+        A = self.mixing_weights(fold_heads(K), active_mask, cand_mask).unsqueeze(1)
         return A @ K, A @ V

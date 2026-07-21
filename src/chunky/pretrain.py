@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-POS_BINS = [(0, 512), (512, 1024), (1024, 2048), (2048, 1 << 30)]
+POS_BINS = [(0, 512), (512, 1024), (1024, 2048), (2048, 4096), (4096, 8192), (8192, 1 << 30)]
 
 from chunky.compressor import CompressorConfig
 from chunky.data import (
@@ -43,15 +43,16 @@ class TrainConfig:
     warmup_frac: float = 0.02
     decay_frac: float = 0.10
     grad_clip: float = 1.0
-    val_docs: int = 500
+    val_docs: int = 40
     val_every: int = 500
     val_batches: int = 20
-    val_lengths: tuple = (4096, 8192, 16384)
+    val_len: int = 16384        # single long val sequence; loss is binned by context length
+    val_corpus: str = "pg19"    # long books so far-context bins populate
     log_every: int = 20
     ckpt_every: int = 2000
     out_dir: str = "checkpoints"
     wandb_project: str = "chunky"
-    run_tag: str = "v2"
+    run_tag: str = "v3"
     seed: int = 0
     grad_accum: int = field(init=False)
 
@@ -137,7 +138,10 @@ def evaluate(model, val, device, eos_id, attn_mask, batch_size, max_batches):
             bin_sum[k] += float(tok_loss[m].sum())
             bin_cnt[k] += int(m.sum())
     model.train()
-    bins = {f"{lo}_{hi}": bin_sum[k] / bin_cnt[k] for k, (lo, hi) in enumerate(POS_BINS) if bin_cnt[k]}
+    def _label(lo, hi):
+        return f"{lo}_{hi if hi < (1 << 30) else 'inf'}"
+
+    bins = {_label(lo, hi): bin_sum[k] / bin_cnt[k] for k, (lo, hi) in enumerate(POS_BINS) if bin_cnt[k]}
     overall = sum(bin_sum) / max(sum(bin_cnt), 1)
     return overall, bins
 
@@ -176,16 +180,21 @@ def train(cfg: TrainConfig, tokenizer, log=print) -> None:
 
     engine = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank]) if ddp else model
 
-    dataset = StreamingPacked(tokenizer, corpus, cfg.seq_len, skip_docs=cfg.val_docs + docs_prev,
+    # Val uses a separate corpus (pg19), so no train/val overlap and no skip needed.
+    # We also do NOT skip docs_prev on resume (skipping millions of docs stalls startup).
+    dataset = StreamingPacked(tokenizer, corpus, cfg.seq_len, skip_docs=0,
                               rank=rank, world_size=world)
     batches = iter(DataLoader(dataset, batch_size=cfg.micro_batch, num_workers=0, pin_memory=True))
 
     run = None
-    val_sets = {}
+    val = []
     if rank == 0:
-        val_sets = {L: held_out_val(tokenizer, corpus, L, cfg.val_docs) for L in cfg.val_lengths}
+        try:
+            val = held_out_val(tokenizer, CORPORA[cfg.val_corpus], cfg.val_len, cfg.val_docs)
+        except Exception as e:
+            log(f"val set unavailable ({e}); continuing without validation")
         log(f"model={cfg.variant}/{cfg.scale} params={model.num_params():,} steps={total_steps} "
-            f"val_lengths={cfg.val_lengths}")
+            f"val_windows={len(val)}@{cfg.val_len}")
         try:
             import wandb
             name = f"{cfg.variant}-{cfg.scale}-{cfg.run_tag}"
@@ -221,27 +230,29 @@ def train(cfg: TrainConfig, tokenizer, log=print) -> None:
             if run:
                 run.log({"train/loss": loss_sum, "train/ppl": math.exp(min(loss_sum, 20)), "lr": lr}, step=step)
 
-        if rank == 0 and step > 0 and step % cfg.val_every == 0:
-            metrics = {}
-            for L in cfg.val_lengths:
-                vbatch = cfg.micro_batch if L <= cfg.seq_len else 1  # long seqs are O(L^2) on standard/window
-                vmask = sliding_window_mask(L, cfg.budget, device) if cfg.variant == "window" else None
-                vloss, bins = evaluate(model, val_sets[L], device, eos_id, vmask, vbatch, cfg.val_batches)
-                log(f"  val@{L} loss={vloss:.4f} ppl={math.exp(min(vloss, 20)):.2f} "
+        if rank == 0 and val and step > 0 and step % cfg.val_every == 0:
+            vmask = sliding_window_mask(cfg.val_len, cfg.budget, device) if cfg.variant == "window" else None
+            try:
+                vloss, bins = evaluate(model, val, device, eos_id, vmask, 1, cfg.val_batches)
+            except RuntimeError as e:  # e.g. OOM on very long val; don't kill training
+                torch.cuda.empty_cache()
+                log(f"  val skipped: {e}")
+            else:
+                log(f"  val nll={vloss:.4f} ppl={math.exp(min(vloss, 20)):.2f} "
                     + " ".join(f"[{b}]={v:.3f}" for b, v in bins.items()))
-                metrics[f"val_{L}/loss"] = vloss
-                metrics[f"val_{L}/ppl"] = math.exp(min(vloss, 20))
-                for b, v in bins.items():
-                    metrics[f"val_{L}/ppl_ctx_{b}"] = math.exp(min(v, 20))
-            if run:
-                run.log(metrics, step=step)
+                if run:
+                    metrics = {"val/nll": vloss, "val/ppl": math.exp(min(vloss, 20))}
+                    for b, v in bins.items():
+                        metrics[f"val/nll_ctx_{b}"] = v
+                        metrics[f"val/ppl_ctx_{b}"] = math.exp(min(v, 20))
+                    run.log(metrics, step=step)
 
         if rank == 0 and step > 0 and step % cfg.ckpt_every == 0:
             docs_trained = docs_prev + world * dataset.docs_consumed
             save_ckpt(latest, model, opt, step, docs_trained, cfg)
             log(f"  saved checkpoint step={step} docs_trained={docs_trained}")
 
-    if rank == 0:
+    if rank == 0 and total_steps > start_step:  # only if we actually trained
         save_ckpt(latest, model, opt, total_steps - 1, docs_prev + world * dataset.docs_consumed, cfg)
     if run:
         run.finish()

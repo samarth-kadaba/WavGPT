@@ -78,13 +78,16 @@ class Attention(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=attn_mask is None)
         return self.proj(out.transpose(1, 2).reshape(B, T, -1))
 
-    def forward_streaming(self, x, cos, sin, mem_k, mem_v):
+    def forward_streaming(self, x, cos, sin, mem_k, mem_v, mem_active):
         B, T, _ = x.shape
         q, k, v = self._qkv(x, cos, sin)
         K = k if mem_k is None else torch.cat((mem_k, k), dim=2)
         V = v if mem_v is None else torch.cat((mem_v, v), dim=2)
         m = 0 if mem_k is None else mem_k.size(2)
         mask = x.new_zeros(T, m + T)
+        # Exclude inactive (zero-padded) memory slots so they don't steal softmax mass.
+        if m and mem_active is not None:
+            mask[:, :m].masked_fill_(~mem_active.view(1, m), float("-inf"))
         mask[:, m:].masked_fill_(torch.ones(T, T, dtype=torch.bool, device=x.device).triu(1), float("-inf"))
         out = F.scaled_dot_product_attention(q, K, V, attn_mask=mask)
         return self.proj(out.transpose(1, 2).reshape(B, T, -1)), k, v
@@ -114,8 +117,8 @@ class Block(nn.Module):
         x = x + self.attn(self.attn_norm(x), cos, sin, attn_mask)
         return x + self.ffn(self.ffn_norm(x))
 
-    def forward_streaming(self, x, cos, sin, mem_k, mem_v):
-        attn_out, k, v = self.attn.forward_streaming(self.attn_norm(x), cos, sin, mem_k, mem_v)
+    def forward_streaming(self, x, cos, sin, mem_k, mem_v, mem_active):
+        attn_out, k, v = self.attn.forward_streaming(self.attn_norm(x), cos, sin, mem_k, mem_v, mem_active)
         x = x + attn_out
         return x + self.ffn(self.ffn_norm(x)), k, v
 

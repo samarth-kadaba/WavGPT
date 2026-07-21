@@ -29,6 +29,7 @@ class CompressedTransformer(Transformer):
         L = len(self.blocks)
         mem_k = [None] * L
         mem_v = [None] * L
+        mem_active = [None] * L  # which memory slots are valid (for attention masking)
         chunks = []
 
         for start in range(0, T, self.chunk_size):
@@ -36,13 +37,21 @@ class CompressedTransformer(Transformer):
             cos, sin = self.rope_cos[start:end], self.rope_sin[start:end]
             x = self.embed(input_ids[:, start:end])
             active = active_slot_mask(self.comp_cfg, float(end), x.device)
+            active_bool = active > 0.5
 
+            B = x.size(0)
+            chunk_valid = x.new_ones(B, x.size(1), dtype=torch.bool)
             for i, block in enumerate(self.blocks):
-                x, k, v = block.forward_streaming(x, cos, sin, mem_k[i], mem_v[i])
-                pool_k = k if mem_k[i] is None else torch.cat((mem_k[i], k), dim=2)
-                pool_v = v if mem_v[i] is None else torch.cat((mem_v[i], v), dim=2)
-                nk, nv = self.compressor(pool_k, pool_v, active_mask=active)
+                x, k, v = block.forward_streaming(x, cos, sin, mem_k[i], mem_v[i], mem_active[i])
+                if mem_k[i] is None:
+                    pool_k, pool_v, cand_mask = k, v, None
+                else:
+                    pool_k = torch.cat((mem_k[i], k), dim=2)
+                    pool_v = torch.cat((mem_v[i], v), dim=2)
+                    cand_mask = torch.cat((mem_active[i].view(1, -1).expand(B, -1), chunk_valid), dim=1)
+                nk, nv = self.compressor(pool_k, pool_v, active_mask=active, cand_mask=cand_mask)
                 mem_k[i], mem_v[i] = (nk.detach(), nv.detach()) if self.detach_memory else (nk, nv)
+                mem_active[i] = active_bool
 
             chunks.append(self.lm_head(self.norm(x)))
 

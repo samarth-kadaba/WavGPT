@@ -35,6 +35,7 @@ class Corpus:
 
 CORPORA = {
     "fineweb-edu": Corpus("HuggingFaceFW/fineweb-edu", name="sample-10BT"),
+    "pg19": Corpus("emozilla/pg19"),  # long books, for long-context validation
     "wikitext": Corpus("Salesforce/wikitext", name="wikitext-103-raw-v1", split="test"),
     "c4": Corpus("allenai/c4", name="en", split="validation"),
     "books3": Corpus("SaylorTwift/the_pile_books3_minus_gutenberg"),
@@ -136,11 +137,11 @@ class StreamingPacked(IterableDataset):
                     del seg_buf[: self.seq_length]
 
 
-def held_out_val(tokenizer, corpus: Corpus, seq_length: int, n_docs: int):
-    """Pack the first n_docs documents into windows for validation."""
+def held_out_val(tokenizer, corpus: Corpus, seq_length: int, n_docs: int, max_windows: int = 200):
+    """Pack the first n_docs documents into up to max_windows validation windows."""
     stream = _open_stream(corpus).take(n_docs)
     docs = _token_docs(stream, tokenizer, corpus.text_key, min_chars=200)
-    ids, segs = pack_documents(docs, seq_length, tokenizer.eos_token_id, max_sequences=10**9)
+    ids, segs = pack_documents(docs, seq_length, tokenizer.eos_token_id, max_sequences=max_windows)
     return [{"input_ids": i, "seg_ids": s} for i, s in zip(ids, segs)]
 
 
